@@ -25,6 +25,7 @@ const devices = new Map(); // fingerprint -> device info
 const pendingIncomingSessions = new Map(); // sessionId -> session object
 const pendingOutgoingSessions = new Map(); // sessionId -> session object
 let activeIncomingSession = null; // Currently active receive session
+const activeTransfers = new Map(); // sessionId -> { type: 'send'|'receive', req, stream, peer, isPaused: false }
 
 function createLocalDevice() {
   const hostname = os.hostname();
@@ -364,6 +365,14 @@ function startHttpServer() {
           const startedAt = Date.now();
           let lastReportedAt = Date.now();
 
+          activeTransfers.set(sessionId, {
+            type: 'receive',
+            req,
+            stream: writeStream,
+            peer: session.sender,
+            isPaused: false
+          });
+
           req.on('data', (chunk) => {
             writeStream.write(chunk);
             received += chunk.length;
@@ -384,6 +393,7 @@ function startHttpServer() {
                 senderId: session.sender.fingerprint,
                 name: file.fileName,
                 size: file.size,
+                transferred: received,
                 progress: (received / file.size) * 100,
                 speedMbps,
                 avgSpeedMbps: (received * 8) / ((now - startedAt) / 1000 || 0.001) / 1000000,
@@ -393,6 +403,7 @@ function startHttpServer() {
           });
 
           req.on('end', () => {
+            activeTransfers.delete(sessionId);
             writeStream.end();
             file.status = 'completed';
             log('success', `File received: ${file.fileName}`);
@@ -403,6 +414,7 @@ function startHttpServer() {
               senderId: session.sender.fingerprint,
               name: file.fileName,
               size: file.size,
+              transferred: file.size,
               progress: 100,
               speedMbps: 0,
               avgSpeedMbps: 0,
@@ -430,6 +442,7 @@ function startHttpServer() {
           });
 
           req.on('error', (err) => {
+            activeTransfers.delete(sessionId);
             writeStream.end();
             file.status = 'failed';
             log('error', `Error receiving file ${file.fileName}: ${err.message}`);
@@ -921,6 +934,7 @@ ipcMain.handle('file:send', async (_event, payload) => {
     }, (res) => {
       res.on('data', () => {});
       res.on('end', () => {
+        activeTransfers.delete(sessionId);
         if (res.statusCode === 200) {
           log('success', `File ${fileName} sent successfully`);
           sendToRenderer('file:progress', {
@@ -929,6 +943,7 @@ ipcMain.handle('file:send', async (_event, payload) => {
             senderId: device.id,
             name: fileName,
             size: stat.size,
+            transferred: stat.size,
             progress: 100,
             speedMbps: 0,
             avgSpeedMbps: 0,
@@ -946,7 +961,16 @@ ipcMain.handle('file:send', async (_event, payload) => {
       });
     });
 
+    activeTransfers.set(sessionId, {
+      type: 'send',
+      req,
+      stream: fileStream,
+      peer,
+      isPaused: false
+    });
+
     req.on('error', (err) => {
+      activeTransfers.delete(sessionId);
       fileStream.destroy();
       sendToRenderer('file:progress', {
         transferId: sessionId,
@@ -979,6 +1003,7 @@ ipcMain.handle('file:send', async (_event, payload) => {
           senderId: device.id,
           name: fileName,
           size: stat.size,
+          transferred: uploadedBytes,
           progress: (uploadedBytes / stat.size) * 100,
           speedMbps,
           avgSpeedMbps: (uploadedBytes * 8) / ((now - startedAt) / 1000 || 0.001) / 1000000,
@@ -1104,6 +1129,96 @@ ipcMain.handle('chat:send', async (_event, payload) => {
     req.write(textBytes);
     req.end();
   });
+});
+
+ipcMain.handle('lan:cancel-transfer', async (_event, sessionId) => {
+  const transfer = activeTransfers.get(sessionId);
+  if (!transfer) return { ok: false, error: 'Transfer not found' };
+
+  log('warning', `Manually canceling transfer ${sessionId}...`);
+
+  // 1. Notify the remote peer of cancellation
+  try {
+    const peer = transfer.peer;
+    const ip = peer.ip || peer.address;
+    const port = peer.port || 53317;
+    if (ip) {
+      const cancelReq = http.request({
+        hostname: ip,
+        port: port,
+        path: `/api/localsend/v2/cancel?sessionId=${sessionId}`,
+        method: 'POST'
+      }, (res) => {
+        res.on('data', () => {});
+      });
+      cancelReq.on('error', () => {});
+      cancelReq.end();
+    }
+  } catch (err) {
+    // ignore notification error
+  }
+
+  // 2. Destroy local streams and connections
+  if (transfer.stream) {
+    try {
+      transfer.stream.destroy();
+    } catch (e) {}
+  }
+  if (transfer.req) {
+    try {
+      transfer.req.destroy();
+    } catch (e) {}
+  }
+
+  // 3. Emit local status update
+  sendToRenderer('file:progress', {
+    transferId: sessionId,
+    status: 'canceled',
+    speedMbps: 0
+  });
+
+  // 4. Remove from active tracking
+  activeTransfers.delete(sessionId);
+
+  return { ok: true };
+});
+
+ipcMain.handle('lan:toggle-pause-transfer', async (_event, sessionId) => {
+  const transfer = activeTransfers.get(sessionId);
+  if (!transfer) return { ok: false, error: 'Transfer not found' };
+
+  if (transfer.isPaused) {
+    // Resume
+    log('info', `Resuming transfer ${sessionId}...`);
+    if (transfer.type === 'send') {
+      transfer.stream.resume();
+    } else {
+      transfer.req.resume();
+    }
+    transfer.isPaused = false;
+
+    sendToRenderer('file:progress', {
+      transferId: sessionId,
+      status: transfer.type === 'send' ? 'sending' : 'receiving'
+    });
+  } else {
+    // Pause
+    log('info', `Pausing transfer ${sessionId}...`);
+    if (transfer.type === 'send') {
+      transfer.stream.pause();
+    } else {
+      transfer.req.pause();
+    }
+    transfer.isPaused = true;
+
+    sendToRenderer('file:progress', {
+      transferId: sessionId,
+      status: 'paused',
+      speedMbps: 0
+    });
+  }
+
+  return { ok: true, isPaused: transfer.isPaused };
 });
 
 // Stub WebRTC calls (since LocalSend is file-sharing only, we bypass signaling)

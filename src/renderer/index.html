@@ -231,8 +231,36 @@
         <button id="acceptInviteBtn" class="btn btn-primary" type="button">Accept</button>
       </div>
     </div>
+  <!-- SPEED CHART MODAL -->
+  <div class="modal-backdrop" id="speedChartModal">
+    <div class="modal-card panel chart-modal">
+      <div class="modal-header">
+        <div class="modal-header-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+        </div>
+        <div style="flex-grow: 1;">
+          <h3 id="chartModalTitle">file_name.bin</h3>
+          <p class="muted" id="chartModalSubtitle">Sending • 45.2% • 12.34 Mbps</p>
+        </div>
+      </div>
+      
+      <div class="modal-body">
+        <div class="chart-container" style="position: relative; height: 240px; width: 100%">
+          <canvas id="speedChartCanvas"></canvas>
+        </div>
+      </div>
+      
+      <div class="modal-footer">
+        <button id="modalPauseBtn" class="btn btn-secondary" type="button" style="display: none;">Pause</button>
+        <button id="modalCancelBtn" class="btn btn-secondary btn-danger" type="button" style="display: none;">Cancel</button>
+        <button id="modalDeleteBtn" class="btn btn-secondary btn-danger" type="button" style="display: none;">Delete</button>
+        <button id="modalCloseBtn" class="btn btn-primary" type="button">Close</button>
+      </div>
+    </div>
   </div>
 
+  <!-- Chart.js library -->
+  <script src="../../node_modules/chart.js/dist/chart.umd.js"></script>
   <script src="./renderer.js"></script>
 </body>
 </html>

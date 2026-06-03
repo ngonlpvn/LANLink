@@ -22,6 +22,8 @@ contextBridge.exposeInMainWorld('lanlink', {
   rescan: () => ipcRenderer.invoke('lan:rescan'),
   acceptInvite: (sessionId) => ipcRenderer.invoke('lan:accept-invite', sessionId),
   declineInvite: (sessionId) => ipcRenderer.invoke('lan:decline-invite', sessionId),
+  cancelTransfer: (sessionId) => ipcRenderer.invoke('lan:cancel-transfer', sessionId),
+  togglePauseTransfer: (sessionId) => ipcRenderer.invoke('lan:toggle-pause-transfer', sessionId),
   onStatus: (callback) => subscribe('lan:status', callback),
   onDevices: (callback) => subscribe('lan:devices', callback),
   onLog: (callback) => subscribe('lan:log', callback),

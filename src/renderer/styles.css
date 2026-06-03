@@ -1250,3 +1250,82 @@ p, .muted {
     transform: translateY(0);
   }
 }
+
+/* ----------------------------------------------------
+   TRANSFER ACTIONS & SPEED CHART
+---------------------------------------------------- */
+.transfer-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  margin-right: 8px;
+}
+
+.btn-icon-action {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.btn-icon-action:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text-normal);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+.btn-icon-action.cancel:hover {
+  background: rgba(239, 68, 68, 0.1);
+  color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.3);
+}
+
+.btn-icon-action.delete:hover {
+  background: rgba(239, 68, 68, 0.1);
+  color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.3);
+}
+
+.modal-card.chart-modal {
+  width: 620px;
+  max-width: 95%;
+}
+
+.modal-header-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  background: rgba(34, 211, 238, 0.08);
+  border: 1px solid rgba(34, 211, 238, 0.2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent-cyan);
+}
+
+.chart-container {
+  margin: 10px 0;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.02);
+  padding: 12px;
+}
+
+.btn-danger {
+  color: #ffffff !important;
+  background: rgba(239, 68, 68, 0.2) !important;
+  border: 1px solid rgba(239, 68, 68, 0.4) !important;
+}
+
+.btn-danger:hover {
+  background: rgba(239, 68, 68, 0.35) !important;
+  border-color: rgba(239, 68, 68, 0.6) !important;
+}

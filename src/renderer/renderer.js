@@ -8,7 +8,9 @@ const state = {
   activeTab: 'files', // 'files' or 'text'
   activeTransfers: new Map(), // transferId -> progress object
   currentInvite: null, // holds details of currently visible incoming invite
-  chatHistory: [] // array of messages: { id, sender: { id, alias }, receiverId, text, time }
+  chatHistory: [], // array of messages: { id, sender: { id, alias }, receiverId, text, time }
+  activeChartSessionId: null,
+  speedChartInstance: null
 };
 
 // --- DOM Cache ---
@@ -53,7 +55,16 @@ const els = {
   inviteSenderName: document.getElementById('inviteSenderName'),
   inviteFileList: document.getElementById('inviteFileList'),
   declineInviteBtn: document.getElementById('declineInviteBtn'),
-  acceptInviteBtn: document.getElementById('acceptInviteBtn')
+  acceptInviteBtn: document.getElementById('acceptInviteBtn'),
+
+  // Speed Chart Modal
+  speedChartModal: document.getElementById('speedChartModal'),
+  chartModalTitle: document.getElementById('chartModalTitle'),
+  chartModalSubtitle: document.getElementById('chartModalSubtitle'),
+  modalPauseBtn: document.getElementById('modalPauseBtn'),
+  modalCancelBtn: document.getElementById('modalCancelBtn'),
+  modalDeleteBtn: document.getElementById('modalDeleteBtn'),
+  modalCloseBtn: document.getElementById('modalCloseBtn')
 };
 
 // --- Boot & Initialization ---
@@ -238,6 +249,14 @@ function bindEvents() {
   els.declineInviteBtn.addEventListener('click', declineIncomingInvite);
   els.acceptInviteBtn.addEventListener('click', acceptIncomingInvite);
 
+  // Speed Chart Modal Listeners
+  els.modalCloseBtn.addEventListener('click', window.closeSpeedChartModal);
+  els.speedChartModal.addEventListener('click', (e) => {
+    if (e.target === els.speedChartModal) {
+      window.closeSpeedChartModal();
+    }
+  });
+
   // Clear Event Logs button
   els.clearLogBtn.addEventListener('click', () => {
     els.eventLog.innerHTML = '';
@@ -281,9 +300,28 @@ function registerIpcListeners() {
 
   // Upload/Download file progress update
   window.lanlink.onFileProgress((progress) => {
-    const existing = state.activeTransfers.get(progress.transferId) || {};
-    state.activeTransfers.set(progress.transferId, { ...existing, ...progress });
+    const existing = state.activeTransfers.get(progress.transferId) || { speedHistory: [] };
+    const updated = { ...existing, ...progress };
+
+    // Record speed history during active transfers
+    if ((progress.status === 'sending' || progress.status === 'receiving') && progress.speedMbps !== undefined) {
+      updated.speedHistory = existing.speedHistory || [];
+      updated.speedHistory.push({
+        time: Date.now(),
+        speed: progress.speedMbps
+      });
+      if (updated.speedHistory.length > 40) {
+        updated.speedHistory.shift();
+      }
+    }
+
+    state.activeTransfers.set(progress.transferId, updated);
     renderTransmissions();
+
+    // Real-time speed chart update if this session's modal is active
+    if (state.activeChartSessionId === progress.transferId) {
+      updateActiveChart(updated);
+    }
   });
 
   // Handle incoming or sent chat message
@@ -561,21 +599,52 @@ function renderTransmissions() {
     return;
   }
 
-  els.transferList.innerHTML = list.map(item => `
-    <div class="transfer-card">
-      <div class="transfer-card-header">
-        <span class="transfer-filename" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</span>
-        <span class="transfer-status-tag ${item.status}">${escapeHtml(item.status)}</span>
+  els.transferList.innerHTML = list.map(item => {
+    let actionsHtml = '';
+    const isActive = item.status === 'sending' || item.status === 'receiving' || item.status === 'paused';
+    if (isActive) {
+      const isPaused = item.status === 'paused';
+      const pauseIcon = isPaused
+        ? `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>` // Play
+        : `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`; // Pause
+      
+      actionsHtml = `
+        <div class="transfer-actions">
+          <button class="btn-icon-action" onclick="togglePauseTransfer(event, '${item.transferId}')" title="${isPaused ? 'Resume' : 'Pause'}">
+            ${pauseIcon}
+          </button>
+          <button class="btn-icon-action cancel" onclick="cancelTransfer(event, '${item.transferId}')" title="Cancel">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+      `;
+    } else {
+      actionsHtml = `
+        <div class="transfer-actions">
+          <button class="btn-icon-action delete" onclick="deleteTransfer(event, '${item.transferId}')" title="Remove from list">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+          </button>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="transfer-card" onclick="openSpeedChartModal('${item.transferId}')" style="cursor: pointer;">
+        <div class="transfer-card-header">
+          <span class="transfer-filename" title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</span>
+          ${actionsHtml}
+          <span class="transfer-status-tag ${item.status}">${escapeHtml(item.status)}</span>
+        </div>
+        <div class="transfer-progress-track">
+          <div class="transfer-progress-fill" style="width: ${item.progress}%"></div>
+        </div>
+        <div class="transfer-card-footer">
+          <span>${Math.round(item.progress)}% • ${formatProgressBytes(item.transferred, item.size)}</span>
+          <span>${item.speedMbps ? (item.speedMbps / 8).toFixed(2) + ' MB/s' : '0.00 MB/s'}</span>
+        </div>
       </div>
-      <div class="transfer-progress-track">
-        <div class="transfer-progress-fill" style="width: ${item.progress}%"></div>
-      </div>
-      <div class="transfer-card-footer">
-        <span>${Math.round(item.progress)}% • ${formatBytes(item.size)}</span>
-        <span>${item.speedMbps ? item.speedMbps.toFixed(2) + ' Mbps' : '0.00 Mbps'}</span>
-      </div>
-    </div>
-  `).join('');
+    `;
+  }).join('');
 }
 
 function addLog(type, message) {
@@ -603,6 +672,21 @@ function formatBytes(bytes, decimals = 2) {
   return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
 }
 
+function formatProgressBytes(transferred, total, decimals = 2) {
+  const t = +transferred || 0;
+  const tot = +total || 0;
+  if (!tot) return '0 Bytes / 0 Bytes';
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(tot) / Math.log(k));
+  
+  const totalScaled = parseFloat((tot / Math.pow(k, i)).toFixed(dm));
+  const transferredScaled = parseFloat((t / Math.pow(k, i)).toFixed(dm));
+  
+  return `${transferredScaled} / ${totalScaled} ${sizes[i]}`;
+}
+
 function escapeHtml(unsafe) {
   return String(unsafe || '')
     .replace(/&/g, '&amp;')
@@ -611,3 +695,157 @@ function escapeHtml(unsafe) {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#039;');
 }
+
+// --- Speed Chart Modal & Actions ---
+
+window.openSpeedChartModal = function(transferId) {
+  const item = state.activeTransfers.get(transferId);
+  if (!item) return;
+
+  state.activeChartSessionId = transferId;
+  
+  // Set modal texts
+  els.chartModalTitle.textContent = item.name;
+  
+  // Open modal in DOM
+  els.speedChartModal.classList.add('open');
+
+  // Create Chart
+  const ctx = document.getElementById('speedChartCanvas').getContext('2d');
+  
+  // Extract history
+  const history = item.speedHistory || [];
+  const data = history.map(h => h.speed / 8); // convert to MB/s
+  const labels = history.map(() => '');
+
+  // Destroy existing chart if any
+  if (state.speedChartInstance) {
+    state.speedChartInstance.destroy();
+  }
+
+  // Draw chart
+  state.speedChartInstance = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [{
+        label: 'Speed (MB/s)',
+        data: data,
+        borderColor: '#22d3ee', // var(--accent-cyan)
+        backgroundColor: 'rgba(34, 211, 238, 0.08)',
+        borderWidth: 2,
+        tension: 0.25,
+        fill: true,
+        pointRadius: 2,
+        pointBackgroundColor: '#22d3ee'
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false }
+      },
+      scales: {
+        x: {
+          grid: { display: false },
+          ticks: { color: 'rgba(255, 255, 255, 0.4)', font: { size: 9 } }
+        },
+        y: {
+          min: 0,
+          grid: { color: 'rgba(255, 255, 255, 0.05)' },
+          ticks: { color: 'rgba(255, 255, 255, 0.4)', font: { size: 9 } }
+        }
+      }
+    }
+  });
+
+  // Perform initial update of text and buttons
+  updateActiveChart(item);
+};
+
+window.closeSpeedChartModal = function() {
+  els.speedChartModal.classList.remove('open');
+  state.activeChartSessionId = null;
+  if (state.speedChartInstance) {
+    state.speedChartInstance.destroy();
+    state.speedChartInstance = null;
+  }
+};
+
+function updateActiveChart(item) {
+  if (!state.speedChartInstance) return;
+
+  const subtitleEl = document.getElementById('chartModalSubtitle');
+  if (subtitleEl) {
+    const statusText = item.status === 'sending' ? 'Sending' : (item.status === 'receiving' ? 'Receiving' : (item.status === 'paused' ? 'Paused' : item.status));
+    subtitleEl.innerHTML = `${statusText} • ${Math.round(item.progress)}% • ${formatProgressBytes(item.transferred, item.size)} • ${item.speedMbps ? (item.speedMbps / 8).toFixed(2) + ' MB/s' : '0.00 MB/s'}`;
+  }
+
+  updateModalButtons(item);
+
+  const history = item.speedHistory || [];
+  const data = history.map(h => h.speed / 8); // convert to MB/s
+  const labels = history.map(() => '');
+
+  state.speedChartInstance.data.labels = labels;
+  state.speedChartInstance.data.datasets[0].data = data;
+  state.speedChartInstance.update('none'); // silent update (faster)
+}
+
+function updateModalButtons(item) {
+  const isActive = item.status === 'sending' || item.status === 'receiving' || item.status === 'paused';
+  if (isActive) {
+    els.modalPauseBtn.style.display = 'inline-block';
+    els.modalCancelBtn.style.display = 'inline-block';
+    els.modalDeleteBtn.style.display = 'none';
+
+    els.modalPauseBtn.textContent = item.status === 'paused' ? 'Resume' : 'Pause';
+    
+    // Set up click handlers dynamically for the modal buttons
+    els.modalPauseBtn.onclick = (e) => window.togglePauseTransfer(e, item.transferId);
+    els.modalCancelBtn.onclick = (e) => {
+      window.cancelTransfer(e, item.transferId);
+      window.closeSpeedChartModal();
+    };
+  } else {
+    els.modalPauseBtn.style.display = 'none';
+    els.modalCancelBtn.style.display = 'none';
+    els.modalDeleteBtn.style.display = 'inline-block';
+
+    els.modalDeleteBtn.onclick = (e) => {
+      window.deleteTransfer(e, item.transferId);
+      window.closeSpeedChartModal();
+    };
+  }
+}
+
+window.togglePauseTransfer = async function(event, transferId) {
+  if (event) event.stopPropagation();
+  try {
+    const result = await window.lanlink.togglePauseTransfer(transferId);
+    if (!result.ok) {
+      addLog('error', `Failed to pause/resume: ${result.error}`);
+    }
+  } catch (err) {
+    addLog('error', `Pause/Resume failed: ${err.message}`);
+  }
+};
+
+window.cancelTransfer = async function(event, transferId) {
+  if (event) event.stopPropagation();
+  try {
+    const result = await window.lanlink.cancelTransfer(transferId);
+    if (!result.ok) {
+      addLog('error', `Failed to cancel transfer: ${result.error}`);
+    }
+  } catch (err) {
+    addLog('error', `Cancel transfer failed: ${err.message}`);
+  }
+};
+
+window.deleteTransfer = function(event, transferId) {
+  if (event) event.stopPropagation();
+  state.activeTransfers.delete(transferId);
+  renderTransmissions();
+};
