@@ -16,7 +16,6 @@ contextBridge.exposeInMainWorld('lanlink', {
   sendFile: (payload) => ipcRenderer.invoke('file:send', payload),
   sendSignal: (payload) => ipcRenderer.invoke('webrtc:signal', payload),
   sendCallEvent: (payload) => ipcRenderer.invoke('call:event', payload),
-  rescan: () => ipcRenderer.invoke('lan:rescan'),
   connectPeer: (ip) => ipcRenderer.invoke('lan:connect-peer', ip),
   getInterfaces: () => ipcRenderer.invoke('app:get-interfaces'),
   setActiveIp: (ip) => ipcRenderer.invoke('app:set-active-ip', ip),

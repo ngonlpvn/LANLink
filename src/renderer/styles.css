@@ -118,6 +118,52 @@ p,
   margin: 12px 0 16px;
 }
 
+.local-ip-panel {
+  margin: 12px 0 4px;
+}
+
+.local-ip-list {
+  display: grid;
+  gap: 8px;
+}
+
+.local-ip-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 2px 8px;
+  width: 100%;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  padding: 9px 10px;
+  color: var(--text);
+  background: rgba(9, 17, 26, 0.58);
+  text-align: left;
+  cursor: pointer;
+}
+
+.local-ip-item:hover {
+  border-color: var(--cyan);
+}
+
+.local-ip-item span {
+  color: var(--cyan);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.local-ip-item strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.local-ip-item small {
+  grid-column: 2;
+  color: var(--muted);
+}
+
 .pair-form label {
   color: var(--muted);
   font-size: 11px;
@@ -392,6 +438,10 @@ p,
   border: 1px dashed var(--border);
   border-radius: 12px;
   text-align: center;
+}
+
+.empty-state.compact {
+  min-height: 54px;
 }
 
 .chat-message {

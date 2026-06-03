@@ -1,7 +1,7 @@
 {
   "name": "lanlink",
   "version": "1.0.0",
-  "description": "LANLink desktop app for LAN discovery, messaging, file transfer, and WebRTC calls.",
+  "description": "LANLink desktop app for manual LAN peer messaging, file transfer, and WebRTC calls.",
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",

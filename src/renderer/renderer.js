@@ -1,6 +1,7 @@
 const state = {
   me: null,
-  status: { role: 'Scanning', localIp: 'Detecting...', connected: false },
+  status: { role: 'Host', localIp: 'Detecting...', connected: false },
+  interfaces: [],
   devices: [],
   selectedTargets: new Set(),
   messages: [],
@@ -35,7 +36,7 @@ const els = {
   fileSize: document.querySelector('#fileSize'),
   transferList: document.querySelector('#transferList'),
   eventLog: document.querySelector('#eventLog'),
-  rescanBtn: document.querySelector('#rescanBtn'),
+  localIpList: document.querySelector('#localIpList'),
   peerConnectForm: document.querySelector('#peerConnectForm'),
   peerIpInput: document.querySelector('#peerIpInput'),
   peerConnectBtn: document.querySelector('#peerConnectBtn'),
@@ -59,8 +60,8 @@ async function boot() {
   state.me = await window.lanlink.getInfo();
   els.localNameChip.textContent = state.me.name;
 
-  const interfaces = await window.lanlink.getInterfaces();
-  els.ipSelector.innerHTML = interfaces.map(i => `
+  state.interfaces = await window.lanlink.getInterfaces();
+  els.ipSelector.innerHTML = state.interfaces.map(i => `
     <option value="${escapeHtml(i.address)}">${escapeHtml(i.address)} (${escapeHtml(i.type)})</option>
   `).join('');
   if (state.me.ip) els.ipSelector.value = state.me.ip;
@@ -68,6 +69,7 @@ async function boot() {
   initChart();
   bindEvents();
   renderAll();
+  renderLocalIps();
   setInterval(updateChartTelemetry, 1000);
 }
 
@@ -115,23 +117,6 @@ function bindEvents() {
   els.clearTargetsBtn.addEventListener('click', () => {
     state.selectedTargets.clear();
     renderAll();
-  });
-
-  els.rescanBtn.addEventListener('click', async () => {
-    els.rescanBtn.disabled = true;
-    addLog({ type: 'info', message: 'Reloading LAN scan...', time: Date.now() });
-    try {
-      state.selectedTargets.clear();
-      state.transfers.clear();
-      await window.lanlink.rescan();
-      renderAll();
-    } catch (error) {
-      addLog({ type: 'error', message: `Reload scan failed: ${error.message}`, time: Date.now() });
-    } finally {
-      setTimeout(() => {
-        els.rescanBtn.disabled = false;
-      }, 1200);
-    }
   });
 
   els.peerConnectForm.addEventListener('submit', async (event) => {
@@ -246,6 +231,7 @@ function bindEvents() {
 
 function renderAll() {
   renderStatus();
+  renderLocalIps();
   renderDevices();
   renderTargets();
   renderSelectedFile();
@@ -263,10 +249,11 @@ function renderStatus() {
   } else if (!online.length) {
     state.displayedAvgPing = 0;
   }
-  els.roleValue.textContent = state.status.role || state.me?.role || 'Scanning';
+  els.roleValue.textContent = state.status.role || state.me?.role || 'Host';
   if (els.ipSelector) els.ipSelector.value = state.status.localIp || state.me?.ip || '';
-  els.connectionValue.textContent = state.status.connected ? 'Connected' : 'Scanning LAN';
-  els.connectionValue.className = `status-text ${state.status.connected ? 'success' : 'warning'}`;
+  const hasPeer = online.length > 0;
+  els.connectionValue.textContent = hasPeer ? 'Connected' : 'Waiting for peer IP';
+  els.connectionValue.className = `status-text ${hasPeer ? 'success' : 'warning'}`;
   els.onlineValue.textContent = online.length;
   els.pingValue.textContent = `${Math.round(state.displayedAvgPing)} ms`;
   els.deviceCountLabel.textContent = `${online.length} peer online`;
@@ -274,7 +261,7 @@ function renderStatus() {
 
 function renderDevices() {
   if (!state.devices.length) {
-    els.deviceList.innerHTML = '<div class="empty-state">Scanning for LANLink devices...</div>';
+    els.deviceList.innerHTML = '<div class="empty-state">Enter a peer IP and click Connect.</div>';
     return;
   }
 
@@ -348,6 +335,30 @@ function renderDevices() {
     card.querySelector('.device-rtt').textContent = `${device.rtt || 0} ms RTT`;
     card.querySelector('.device-duration').textContent = formatDuration(Date.now() - (device.connectedAt || Date.now()));
   });
+}
+
+function renderLocalIps() {
+  if (!els.localIpList) return;
+  if (!state.interfaces.length) {
+    els.localIpList.innerHTML = '<div class="empty-state compact">No LAN IP detected</div>';
+    return;
+  }
+  els.localIpList.innerHTML = state.interfaces.map((item) => `
+    <button class="local-ip-item" type="button" data-ip="${escapeHtml(item.address)}" title="Use ${escapeHtml(item.address)} as local IP">
+      <span>${escapeHtml(item.type)}</span>
+      <strong>${escapeHtml(item.address)}</strong>
+      <small>${escapeHtml(item.name)}</small>
+    </button>
+  `).join('');
+  for (const button of els.localIpList.querySelectorAll('.local-ip-item')) {
+    button.addEventListener('click', async () => {
+      const updatedIp = await window.lanlink.setActiveIp(button.dataset.ip);
+      state.me.ip = updatedIp;
+      els.ipSelector.value = updatedIp;
+      addLog({ type: 'info', message: `Local IP selected: ${updatedIp}`, time: Date.now() });
+      renderStatus();
+    });
+  }
 }
 
 function renderTargets() {

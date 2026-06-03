@@ -2,30 +2,23 @@ const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
-const dgram = require('dgram');
 const http = require('http');
 const { Server } = require('socket.io');
 const { io: Client } = require('socket.io-client');
 
 const APP_PORT = Number(process.env.LANLINK_PORT || 32150);
-const DISCOVERY_PORT = Number(process.env.LANLINK_DISCOVERY_PORT || 41234);
-const DISCOVERY_MAGIC = 'LANLINK_HOST_V1';
 const PING_INTERVAL_MS = 3000;
 const OFFLINE_TIMEOUT_MS = 12000;
-const DISCOVERY_WAIT_MS = 2500;
 const SOCKET_ACK_TIMEOUT_MS = 5000;
 
 let mainWindow;
-let udpSocket;
 let httpServer;
 let ioServer;
 let socketClient;
-let discoveryTimer;
-let broadcastTimer;
 let pingTimer;
 let offlineTimer;
 let lastPingLogAt = 0;
-let role = 'Scanning';
+let role = 'Ready';
 let hostInfo = null;
 let userSelectedIp = null;
 let pairedPeerIp = null;
@@ -40,7 +33,7 @@ function createLocalDevice() {
     id: `${os.hostname()}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
     name: os.hostname(),
     ip: getLanIp(),
-    role: 'Scanning',
+    role: 'Ready',
     status: 'online',
     rtt: 0,
     connectedAt: Date.now(),
@@ -65,7 +58,6 @@ function getNetworkInterfaces() {
           name,
           address: entry.address,
           netmask: entry.netmask,
-          broadcast: getBroadcastAddress(entry.address, entry.netmask),
           type
         });
       }
@@ -77,19 +69,6 @@ function getNetworkInterfaces() {
     if (a.type !== b.type) return a.type === 'LAN' ? -1 : 1;
     return a.name.localeCompare(b.name);
   });
-}
-
-function ipToInt(ip) {
-  return ip.split('.').reduce((sum, part) => ((sum << 8) + Number(part)) >>> 0, 0);
-}
-
-function intToIp(value) {
-  return [24, 16, 8, 0].map((shift) => (value >>> shift) & 255).join('.');
-}
-
-function getBroadcastAddress(address, netmask) {
-  if (!address || !netmask) return '255.255.255.255';
-  return intToIp((ipToInt(address) | (~ipToInt(netmask))) >>> 0);
 }
 
 function getLanIp() {
@@ -218,42 +197,14 @@ app.on('activate', () => {
 function startLanRuntime() {
   device.ip = getLanIp();
   device.status = 'online';
+  device.role = 'Host';
   device.lastSeen = Date.now();
   devices.set(device.id, device);
-  setupUdpDiscovery();
-  log('info', 'LAN scanning started');
-  discoveryTimer = setTimeout(() => {
-    if (!hostInfo) becomeHost();
-  }, DISCOVERY_WAIT_MS);
-}
-
-function setupUdpDiscovery() {
-  udpSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
-
-  udpSocket.on('message', (buffer, rinfo) => {
-    try {
-      const message = JSON.parse(buffer.toString());
-      if (message.magic !== DISCOVERY_MAGIC || message.deviceId === device.id) return;
-      if (!hostInfo && role !== 'Host') {
-        hostInfo = { ip: rinfo.address, port: message.port, id: message.deviceId, name: message.name };
-        clearTimeout(discoveryTimer);
-        log('success', `Host found: ${message.name} at ${rinfo.address}`);
-        connectToHost(hostInfo);
-      }
-      if (role === 'Host' && message.deviceId < device.id) {
-        log('info', `Peer host detected: ${message.name} at ${rinfo.address}`);
-      }
-    } catch (error) {
-      log('error', 'Invalid discovery packet received', { error: error.message });
-    }
-  });
-
-  udpSocket.on('error', (error) => log('error', 'UDP discovery error', { error: error.message }));
-  udpSocket.bind(DISCOVERY_PORT, () => udpSocket.setBroadcast(true));
+  log('info', 'Manual peer mode started');
+  becomeHost();
 }
 
 function stopHostServices() {
-  clearInterval(broadcastTimer);
   clearInterval(pingTimer);
   clearInterval(offlineTimer);
   socketClient?.close();
@@ -264,35 +215,21 @@ function stopHostServices() {
   httpServer = null;
 }
 
-function stepDownToRemoteHost(remoteHost) {
-  stopHostServices();
-  hostInfo = remoteHost;
-  role = 'Client';
-  device.role = 'Client';
-  device.rtt = 0;
-  devices.clear();
-  devices.set(device.id, device);
-  emitDevices();
-  sendToRenderer('lan:status', { role, localIp: device.ip, connected: false, host: remoteHost });
-  connectToHost(remoteHost);
-}
-
 function becomeHost() {
   if (httpServer || ioServer) return hostReadyPromise || Promise.resolve();
   hostReadyPromise = new Promise((resolve) => {
-  hostInfo = { ip: device.ip, port: APP_PORT, id: device.id, name: device.name };
-  role = 'Host';
-  device.role = 'Host';
-  upsertDevice(device);
-  log('warning', 'No host found');
+    hostInfo = { ip: device.ip, port: APP_PORT, id: device.id, name: device.name };
+    role = 'Host';
+    device.role = 'Host';
+    upsertDevice(device);
 
-  httpServer = http.createServer();
-  ioServer = new Server(httpServer, {
-    cors: { origin: '*' },
-    maxHttpBufferSize: 1e8
-  });
+    httpServer = http.createServer();
+    ioServer = new Server(httpServer, {
+      cors: { origin: '*' },
+      maxHttpBufferSize: 1e8
+    });
 
-  ioServer.on('connection', (socket) => {
+    ioServer.on('connection', (socket) => {
     let registeredId = null;
 
     socket.on('device:hello', (hello) => {
@@ -390,19 +327,19 @@ function becomeHost() {
         if (registeredId !== device.id) log('warning', `Client disconnected: ${offline.name}`);
       }
     });
-  });
+    });
 
-  httpServer.listen(APP_PORT, '0.0.0.0', () => {
-    log('success', 'This device became host');
-    startHostBroadcast();
-    connectToHost({ ip: '127.0.0.1', port: APP_PORT, id: device.id, name: device.name });
-    resolve();
-  });
+    httpServer.listen(APP_PORT, '0.0.0.0', () => {
+      log('success', 'Ready for manual peer connection');
+      sendToRenderer('lan:status', { role, localIp: device.ip, connected: false, host: hostInfo });
+      connectToHost({ ip: '127.0.0.1', port: APP_PORT, id: device.id, name: device.name });
+      resolve();
+    });
 
-  httpServer.on('error', (error) => {
-    log('error', 'Host server failed to start', { error: error.message });
-    resolve();
-  });
+    httpServer.on('error', (error) => {
+      log('error', 'Local server failed to start', { error: error.message });
+      resolve();
+    });
   });
   return hostReadyPromise;
 }
@@ -445,28 +382,6 @@ function deliverLocalEvent(event, payload) {
   }
 }
 
-function startHostBroadcast() {
-  clearInterval(broadcastTimer);
-  broadcastTimer = setInterval(() => {
-    if (!udpSocket) return;
-    const packet = Buffer.from(JSON.stringify({
-      magic: DISCOVERY_MAGIC,
-      deviceId: device.id,
-      name: device.name,
-      ip: device.ip,
-      port: APP_PORT,
-      time: Date.now()
-    }));
-    const targets = new Set(['255.255.255.255']);
-    for (const item of getNetworkInterfaces()) {
-      if (item.broadcast) targets.add(item.broadcast);
-    }
-    for (const target of targets) {
-      udpSocket.send(packet, 0, packet.length, DISCOVERY_PORT, target);
-    }
-  }, 1000);
-}
-
 function connectToHost(host) {
   if (socketClient) {
     socketClient.removeAllListeners();
@@ -488,10 +403,10 @@ function connectToHost(host) {
   });
 
   socketClient.on('connect', () => {
-    log('success', `Connected to host ${host.name}`);
+    log('success', host.id === device.id ? 'Local server bridge ready' : `Connected to peer ${host.name}`);
     socketClient.emit('device:hello', device);
     sendToRenderer('lan:status', { role, localIp: device.ip, connected: true, host });
-    startPingLoop();
+    if (host.id !== device.id) startPingLoop();
   });
 
   socketClient.on('disconnect', () => {
@@ -521,17 +436,16 @@ function connectToHost(host) {
 }
 
 function handleHostLost() {
-  log('warning', 'Host connection lost permanently. Re-scanning LAN...');
-  shutdownRuntime();
-  hostInfo = null;
-  role = 'Scanning';
-  device.role = 'Scanning';
+  log('warning', 'Peer connection lost. Enter the peer IP and connect again if needed.');
   device.rtt = 0;
-  devices.clear();
-  devices.set(device.id, device);
+  for (const item of devices.values()) {
+    if (item.id !== device.id) {
+      item.status = 'offline';
+      item.rtt = 0;
+    }
+  }
   emitDevices();
-  sendToRenderer('lan:status', { role, localIp: device.ip, connected: false, host: null });
-  startLanRuntime();
+  sendToRenderer('lan:status', { role: 'Host', localIp: device.ip, connected: false, host: hostInfo });
 }
 
 function startPingLoop() {
@@ -773,24 +687,6 @@ ipcMain.handle('call:event', async (_event, payload) => {
   return result;
 });
 
-ipcMain.handle('lan:rescan', async () => {
-  log('info', 'Manual LAN rescan started');
-  shutdownRuntime();
-  hostInfo = null;
-  role = 'Scanning';
-  device.role = 'Scanning';
-  device.status = 'online';
-  device.rtt = 0;
-  device.ip = getLanIp();
-  device.lastSeen = Date.now();
-  devices.clear();
-  devices.set(device.id, device);
-  emitDevices();
-  sendToRenderer('lan:status', { role, localIp: device.ip, connected: false, host: null });
-  startLanRuntime();
-  return { ok: true };
-});
-
 ipcMain.handle('lan:connect-peer', async (_event, ip) => {
   const peerIp = String(ip || '').trim();
   if (!isValidIpv4(peerIp)) throw new Error('Invalid peer IP address');
@@ -810,8 +706,6 @@ ipcMain.handle('lan:connect-peer', async (_event, ip) => {
 });
 
 function shutdownRuntime() {
-  clearTimeout(discoveryTimer);
-  clearInterval(broadcastTimer);
   clearInterval(pingTimer);
   clearInterval(offlineTimer);
   socketClient?.close();
@@ -820,6 +714,4 @@ function shutdownRuntime() {
   ioServer = null;
   httpServer?.close();
   httpServer = null;
-  udpSocket?.close();
-  udpSocket = null;
 }

@@ -1,20 +1,20 @@
 # LANLink
 
-LANLink is a cross-platform Electron desktop app for communication between computers on the same LAN. It uses UDP broadcast for automatic host discovery, Socket.IO for realtime coordination, chunked LAN file transfer, Chart.js for transfer speed telemetry, and WebRTC for 1-to-1 voice/video calls.
+LANLink is a cross-platform Electron desktop app for communication between two computers on the same LAN. It uses manual peer IP entry, Socket.IO for realtime coordination, chunked LAN file transfer, Chart.js for transfer speed telemetry, and WebRTC for 1-to-1 voice/video calls.
 
 ## UI/UX Design Plan
 
-LANLink is designed before implementation as a modern dark desktop dashboard for a school project demonstration. The interface keeps operational status visible at all times, avoids a default HTML look, and uses clear panel separation for LAN discovery, messaging, file transfer, charts, calls, and logs.
+LANLink is designed before implementation as a modern dark desktop dashboard for a school project demonstration. The interface keeps operational status visible at all times, avoids a default HTML look, and uses clear panel separation for local IP selection, manual peer connection, messaging, file transfer, charts, calls, and logs.
 
 ### 1. UI/UX Analysis
 
 - Primary users: students demonstrating LAN communication on multiple computers.
-- Main goal: quickly prove that devices discover each other automatically, then send messages, files, and start a 1-to-1 voice/video call.
+- Main goal: quickly pair two devices by IP, then send messages, files, and start a 1-to-1 voice/video call.
 - UX priorities: visible connection state, simple target selection, per-device transfer feedback, readable realtime logs, and stable 1366x768 / 1920x1080 layouts.
 
 ### 2. Overall App Layout
 
-- Left sidebar: LAN device list and target selection.
+- Left sidebar: local Wi-Fi/LAN IP list, peer IP input, paired device list, and target selection.
 - Top status bar: role, local IP, connection status, online device count, average RTT.
 - Center workspace: text chat and file transfer.
 - Right rail: transfer speed chart and voice/video call panel.
@@ -95,7 +95,7 @@ LANLink is designed before implementation as a modern dark desktop dashboard for
 
 - Online: green dot with soft green halo, full opacity, selectable.
 - Offline: red dot with soft red halo, muted opacity, not selectable.
-- Scanning/warning: amber status text.
+- Waiting/warning: amber status text.
 - Connected/success: green status text.
 
 ### 11. Card Components
@@ -158,10 +158,9 @@ LANLink is designed before implementation as a modern dark desktop dashboard for
 ```text
 src/main.js
   Electron main process
-  UDP host discovery
-  Host election
-  Socket.IO server when host
-  Socket.IO client for every app instance
+  Local Socket.IO server
+  Manual peer IP connection
+  Socket.IO client for the selected peer
   Ping RTT loop
   Message relay
   Chunked file transfer relay and receive-to-Downloads
@@ -221,7 +220,7 @@ Run the same command on each computer in the same LAN.
 6. Send a text message.
 7. Pick a file and send it. Progress and Mbps should update per transfer.
 8. Select the online peer and click `Start call` to test voice/video.
-9. If the connection looks stale after changing Wi-Fi/Ethernet, click `Reload`, then enter the peer IP and click `Connect` again.
+9. If the connection looks stale after changing Wi-Fi/Ethernet, choose the correct local IP again, enter the peer IP, and click `Connect` again.
 
 Received files are saved to:
 
@@ -233,13 +232,11 @@ Downloads/LANLinkReceived/
 
 - Allow Node.js or Electron through the firewall on every computer.
 - Make sure all computers are on the same subnet, for example `192.168.1.x`.
-- Disable VPNs during the demo if they change routing or block LAN broadcast.
+- Disable VPNs during the demo if they change routing or block LAN traffic.
 - Use a private/home network profile on Windows, not a public network profile.
-- Confirm these ports are not blocked:
-  - UDP `41234` for LAN host discovery.
-  - TCP `32150` for Socket.IO communication.
+- Confirm TCP `32150` is not blocked. This port is used for Socket.IO communication.
 - For the most stable demo, use only two computers and connect by `Peer IP`.
-- If a device does not appear after changing Wi-Fi/Ethernet, click `Reload`, then connect to the peer IP again.
+- If a device does not appear after changing Wi-Fi/Ethernet, choose the correct local IP and connect to the peer IP again.
 - If webcam or microphone does not work, check OS privacy permissions for Electron/Terminal.
 - If WebRTC video does not connect, test text chat first. WebRTC signaling uses the Socket.IO host, so chat must work before calls can work.
 

@@ -19,9 +19,15 @@
         </div>
 
         <div class="sidebar-tools">
-          <button id="rescanBtn" class="button button-secondary" type="button" title="Reload LAN scan">Reload</button>
           <button id="selectAllBtn" class="button button-secondary" type="button">Select online</button>
           <button id="clearTargetsBtn" class="icon-button" type="button" title="Clear targets">X</button>
+        </div>
+
+        <div class="local-ip-panel">
+          <div class="section-label">
+            <span>This computer IPs</span>
+          </div>
+          <div id="localIpList" class="local-ip-list"></div>
         </div>
 
         <form id="peerConnectForm" class="pair-form">
@@ -43,7 +49,7 @@
         <header class="topbar panel">
           <div class="status-item">
             <span class="status-label">Role</span>
-            <strong id="roleValue">Scanning</strong>
+            <strong id="roleValue">Host</strong>
           </div>
           <div class="status-item">
             <span class="status-label">Local IP</span>
@@ -53,7 +59,7 @@
           </div>
           <div class="status-item">
             <span class="status-label">Connection</span>
-            <strong id="connectionValue" class="status-text warning">Scanning LAN</strong>
+            <strong id="connectionValue" class="status-text warning">Waiting for peer IP</strong>
           </div>
           <div class="status-item">
             <span class="status-label">Online Devices</span>
