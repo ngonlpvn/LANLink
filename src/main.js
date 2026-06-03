@@ -19,6 +19,7 @@ let scanTimer;
 let announceTimer;
 let cleanupTimer;
 let pingTimer;
+let userSelectedIp = null;
 
 const device = createLocalDevice();
 const devices = new Map(); // fingerprint -> device info
@@ -78,6 +79,9 @@ function getNetworkInterfaces() {
 
 function getLanIp() {
   const list = getNetworkInterfaces();
+  if (userSelectedIp && list.some(iface => iface.address === userSelectedIp)) {
+    return userSelectedIp;
+  }
   return list[0]?.address || '127.0.0.1';
 }
 
@@ -113,10 +117,16 @@ function log(type, message, meta = {}) {
 function emitDevices() {
   const list = Array.from(devices.values())
     .filter(d => d.id !== device.id)
-    .map(d => ({
-      ...d,
-      status: Date.now() - d.lastSeen < 12000 ? 'online' : 'offline'
-    }));
+    .map(d => {
+      let status = d.status;
+      if (status === 'online' && Date.now() - d.lastSeen >= 12000) {
+        status = 'offline';
+      }
+      return {
+        ...d,
+        status
+      };
+    });
   sendToRenderer('lan:devices', list);
 }
 
@@ -135,7 +145,8 @@ function upsertDevice(remote) {
     protocol: remote.protocol || 'http',
     download: remote.download || false,
     lastSeen: Date.now(),
-    status: 'online'
+    status: 'online',
+    pingFailures: 0
   });
   emitDevices();
 }
@@ -633,6 +644,14 @@ function checkPeerRegistration(ip) {
       download: false
     });
 
+    let resolved = false;
+    const done = () => {
+      if (resolved) return;
+      resolved = true;
+      clearTimeout(connTimeout);
+      resolve();
+    };
+
     const req = http.request({
       hostname: ip,
       port: 53317, // default LocalSend port
@@ -641,8 +660,7 @@ function checkPeerRegistration(ip) {
       headers: {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(payload)
-      },
-      timeout: 800
+      }
     }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
@@ -656,17 +674,18 @@ function checkPeerRegistration(ip) {
             // Ignore JSON parsing errors
           }
         }
-        resolve();
+        done();
       });
     });
 
-    req.on('error', () => {
-      resolve(); // ignore connection errors
-    });
-
-    req.on('timeout', () => {
+    // Custom connection timeout: destroy request if it hangs in TCP/ARP handshake for more than 1000ms
+    const connTimeout = setTimeout(() => {
       req.destroy();
-      resolve();
+      done();
+    }, 1000);
+
+    req.on('error', () => {
+      done();
     });
 
     req.write(payload);
@@ -681,17 +700,30 @@ function startPingLoop() {
     
     onlinePeers.forEach(peer => {
       const startTime = Date.now();
-      
+      let failed = false;
+
+      const handleFailure = (reason) => {
+        if (failed) return;
+        failed = true;
+        clearTimeout(connTimeout);
+        peer.pingFailures = (peer.pingFailures || 0) + 1;
+        if ((reason === 'ECONNREFUSED' || reason === 'EHOSTUNREACH' || peer.pingFailures >= 2) && peer.status === 'online') {
+          peer.status = 'offline';
+          log('warning', `Device went offline: ${peer.alias} (${reason})`);
+          emitDevices();
+        }
+      };
+
       const req = http.request({
         hostname: peer.ip,
         port: peer.port,
         path: '/api/localsend/v2/info',
-        method: 'GET',
-        timeout: 1500
+        method: 'GET'
       }, (res) => {
         res.on('data', () => {}); // Consume stream so 'end' fires
         res.on('end', () => {
           if (res.statusCode === 200) {
+            clearTimeout(connTimeout);
             peer.pingFailures = 0; // reset failure counter
             const rtt = Date.now() - startTime;
             const currentRtt = peer.rtt || 0;
@@ -700,28 +732,20 @@ function startPingLoop() {
             peer.lastSeen = Date.now(); // update active status
             devices.set(peer.id, peer);
             emitDevices();
+          } else {
+            handleFailure(`HTTP ${res.statusCode}`);
           }
         });
       });
       
-      req.on('error', (err) => {
-        const isDefinitive = err.code === 'ECONNREFUSED' || err.code === 'EHOSTUNREACH';
-        peer.pingFailures = (peer.pingFailures || 0) + 1;
-        if ((isDefinitive || peer.pingFailures >= 2) && peer.status === 'online') {
-          peer.status = 'offline';
-          log('warning', `Device went offline: ${peer.alias} (${err.code || 'error'})`);
-          emitDevices();
-        }
-      });
-      
-      req.on('timeout', () => {
+      // Custom connection timeout: destroy request if it hangs in TCP/ARP handshake for more than 1500ms
+      const connTimeout = setTimeout(() => {
         req.destroy();
-        peer.pingFailures = (peer.pingFailures || 0) + 1;
-        if (peer.pingFailures >= 2 && peer.status === 'online') {
-          peer.status = 'offline';
-          log('warning', `Device went offline: ${peer.alias} (timeout)`);
-          emitDevices();
-        }
+        handleFailure('TIMEOUT');
+      }, 1500);
+
+      req.on('error', (err) => {
+        handleFailure(err.code || 'error');
       });
       
       req.end();
@@ -755,7 +779,7 @@ function startLanRuntime() {
     let changed = false;
     for (const [id, d] of devices.entries()) {
       if (id === device.id) continue;
-      if (Date.now() - d.lastSeen > 16000 && d.status === 'online') {
+      if (Date.now() - d.lastSeen > 12000 && d.status === 'online') {
         d.status = 'offline';
         changed = true;
         log('warning', `Device went offline: ${d.alias}`);
