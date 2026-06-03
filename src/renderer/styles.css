@@ -641,29 +641,109 @@ p, .muted {
   white-space: nowrap;
 }
 
-/* Text Composer styling */
-.text-form {
-  height: 100%;
+/* Chat Messaging Interface */
+.chat-container {
   display: flex;
-}
-
-.text-form textarea {
-  flex: 1;
-  background: rgba(0, 0, 0, 0.25);
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  flex-direction: column;
+  height: 240px;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.04);
   border-radius: var(--radius-md);
-  padding: 12px;
-  color: var(--text-main);
-  outline: none;
-  font-size: 13px;
-  resize: none;
-  height: 120px;
-  font-family: inherit;
-  transition: border-color 0.2s ease;
+  overflow: hidden;
 }
 
-.text-form textarea:focus {
-  border-color: var(--accent-cyan);
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-composer {
+  display: flex;
+  gap: 8px;
+  padding: 8px;
+  background: rgba(0, 0, 0, 0.3);
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+  align-items: center;
+}
+
+.chat-composer input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text-main);
+  font-size: 13px;
+  height: 34px;
+  padding: 0 8px;
+}
+
+.chat-composer input:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.btn-icon-send {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Chat Bubbles */
+.chat-bubble {
+  max-width: 80%;
+  padding: 8px 12px;
+  border-radius: 12px;
+  font-size: 13px;
+  line-height: 1.4;
+  word-break: break-word;
+  position: relative;
+  animation: slide-up 0.2s ease-out forwards;
+}
+
+.chat-bubble.sent {
+  align-self: flex-end;
+  background: linear-gradient(135deg, var(--accent-cyan) 0%, hsl(190, 80%, 40%) 100%);
+  color: hsl(216, 28%, 6%);
+  border-bottom-right-radius: 4px;
+  font-weight: 500;
+}
+
+.chat-bubble.received {
+  align-self: flex-start;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  color: var(--text-main);
+  border-bottom-left-radius: 4px;
+}
+
+.chat-bubble-meta {
+  font-size: 9px;
+  color: var(--text-faint);
+  margin-top: 4px;
+  text-align: right;
+}
+
+.chat-bubble.sent .chat-bubble-meta {
+  color: rgba(13, 22, 33, 0.6);
+  font-weight: 600;
+}
+
+.empty-state-text {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-faint);
+  font-size: 13px;
+  text-align: center;
 }
 
 /* Transmitter Bottom bar */

@@ -7,7 +7,8 @@ const state = {
   selectedFile: null,
   activeTab: 'files', // 'files' or 'text'
   activeTransfers: new Map(), // transferId -> progress object
-  currentInvite: null // holds details of currently visible incoming invite
+  currentInvite: null, // holds details of currently visible incoming invite
+  chatHistory: [] // array of messages: { id, sender: { id, alias }, receiverId, text, time }
 };
 
 // --- DOM Cache ---
@@ -33,7 +34,13 @@ const els = {
   selectedFileName: document.getElementById('selectedFileName'),
   selectedFileSize: document.getElementById('selectedFileSize'),
   clearFileBtn: document.getElementById('clearFileBtn'),
+  
+  // Chat DOMs
+  textMessageForm: document.getElementById('textMessageForm'),
   textMessageInput: document.getElementById('textMessageInput'),
+  sendMsgBtn: document.getElementById('sendMsgBtn'),
+  chatMessages: document.getElementById('chatMessages'),
+
   selectedTargetBadge: document.getElementById('selectedTargetBadge'),
   transmitBtn: document.getElementById('transmitBtn'),
   activeTransmissionsBadge: document.getElementById('activeTransmissionsBadge'),
@@ -69,6 +76,9 @@ async function boot() {
 
     // 4. Register background event listeners from main process
     registerIpcListeners();
+
+    // 5. Initialize transmit bottom bar
+    updateTransmitButtonState();
 
     addLog('success', 'LANLink engine booted successfully. Ready to transmit.');
   } catch (err) {
@@ -160,8 +170,29 @@ function bindEvents() {
     updateTransmitButtonState();
   });
 
-  // Text message change trigger
-  els.textMessageInput.addEventListener('input', updateTransmitButtonState);
+  // Inline Chat Form submit
+  els.textMessageForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const text = els.textMessageInput.value.trim();
+    if (!text || !state.selectedPeerId) return;
+
+    els.textMessageInput.disabled = true;
+    els.sendMsgBtn.disabled = true;
+
+    try {
+      await window.lanlink.sendMessage({
+        text,
+        targets: [state.selectedPeerId]
+      });
+      els.textMessageInput.value = '';
+    } catch (err) {
+      addLog('error', `Message send failed: ${err.message}`);
+    } finally {
+      els.textMessageInput.disabled = false;
+      els.sendMsgBtn.disabled = false;
+      els.textMessageInput.focus();
+    }
+  });
 
   // Connect manually by IP
   els.peerConnectForm.addEventListener('submit', async (e) => {
@@ -200,7 +231,7 @@ function bindEvents() {
     }
   });
 
-  // Transmit Data Action
+  // Transmit Data Action (for files tab only now)
   els.transmitBtn.addEventListener('click', transmitData);
 
   // Invite Modal Action Buttons
@@ -219,6 +250,13 @@ function registerIpcListeners() {
   window.lanlink.onDevices((devicesList) => {
     state.devices = devicesList;
     renderPeersGrid();
+    
+    // If our selected peer went offline, disable input
+    if (state.selectedPeerId && !devicesList.some(d => d.id === state.selectedPeerId && d.status === 'online')) {
+      state.selectedPeerId = null;
+      renderChatMessages();
+      updateTransmitButtonState();
+    }
   });
 
   // Logs from backend
@@ -247,9 +285,15 @@ function registerIpcListeners() {
     renderTransmissions();
   });
 
-  // Handle incoming text message (displayed directly in logs)
+  // Handle incoming or sent chat message
   window.lanlink.onMessage((msg) => {
-    addLog('success', `Received message from ${msg.sender.alias}: "${msg.text}"`);
+    state.chatHistory.push(msg);
+    renderChatMessages();
+    
+    const isSent = msg.sender.id === state.me.id;
+    if (!isSent) {
+      addLog('success', `Message from ${msg.sender.alias}: "${msg.text}"`);
+    }
   });
 }
 
@@ -262,11 +306,15 @@ function switchTab(tab) {
     els.tabTextBtn.classList.remove('active');
     els.tabFilesContent.style.display = 'flex';
     els.tabTextContent.style.display = 'none';
+    els.transmitBtn.style.display = 'inline-flex';
   } else {
     els.tabFilesBtn.classList.remove('active');
     els.tabTextBtn.classList.add('active');
     els.tabFilesContent.style.display = 'none';
     els.tabTextContent.style.display = 'block';
+    els.transmitBtn.style.display = 'none'; // Chat has its own submit composer button
+    
+    renderChatMessages();
   }
   updateTransmitButtonState();
 }
@@ -301,17 +349,25 @@ function selectPeer(peerId) {
   }
   
   renderPeersGrid();
+  renderChatMessages();
   updateTransmitButtonState();
 }
 
 function updateTransmitButtonState() {
   const peerSelected = state.selectedPeerId !== null;
-  let dataReady = false;
+  const fileSelected = state.selectedFile !== null;
 
-  if (state.activeTab === 'files') {
-    dataReady = state.selectedFile !== null;
+  // Toggle bottom transmit button for files tab
+  els.transmitBtn.disabled = !(peerSelected && fileSelected);
+
+  // Toggle chat input state
+  if (peerSelected) {
+    els.textMessageInput.disabled = false;
+    els.sendMsgBtn.disabled = false;
   } else {
-    dataReady = els.textMessageInput.value.trim().length > 0;
+    els.textMessageInput.disabled = true;
+    els.sendMsgBtn.disabled = true;
+    els.textMessageInput.value = '';
   }
 
   // Update target badge details
@@ -325,13 +381,11 @@ function updateTransmitButtonState() {
     els.selectedTargetBadge.textContent = 'No device selected';
     els.selectedTargetBadge.classList.add('empty');
   }
-
-  els.transmitBtn.disabled = !(peerSelected && dataReady);
 }
 
-// Transmit Data Action (REST POST to Peer HTTP Server)
+// Transmit Data Action (REST POST to Peer HTTP Server for Files)
 async function transmitData() {
-  if (!state.selectedPeerId) return;
+  if (!state.selectedPeerId || state.activeTab !== 'files') return;
   
   const peer = state.devices.find(d => d.id === state.selectedPeerId);
   if (!peer) {
@@ -341,37 +395,21 @@ async function transmitData() {
 
   els.transmitBtn.disabled = true;
 
-  if (state.activeTab === 'files') {
-    const file = state.selectedFile;
-    addLog('info', `Requesting transmission for: ${file.name} to ${peer.alias}...`);
-    try {
-      await window.lanlink.sendFile({
-        path: file.path,
-        targets: [peer.id]
-      });
-      addLog('success', `Finished sending ${file.name} to ${peer.alias}`);
-      
-      // Clear file selection
-      state.selectedFile = null;
-      els.selectedFileCard.style.display = 'none';
-      els.fileDropzone.style.display = 'flex';
-    } catch (err) {
-      addLog('error', `Transmission failed: ${err.message}`);
-    }
-  } else {
-    // Message send
-    const text = els.textMessageInput.value.trim();
-    addLog('info', `Transmitting quick clip to ${peer.alias}...`);
-    try {
-      await window.lanlink.sendMessage({
-        text,
-        targets: [peer.id]
-      });
-      addLog('success', `Text sent to ${peer.alias}`);
-      els.textMessageInput.value = '';
-    } catch (err) {
-      addLog('error', `Text transmission failed: ${err.message}`);
-    }
+  const file = state.selectedFile;
+  addLog('info', `Requesting transmission for: ${file.name} to ${peer.alias}...`);
+  try {
+    await window.lanlink.sendFile({
+      path: file.path,
+      targets: [peer.id]
+    });
+    addLog('success', `Finished sending ${file.name} to ${peer.alias}`);
+    
+    // Clear file selection
+    state.selectedFile = null;
+    els.selectedFileCard.style.display = 'none';
+    els.fileDropzone.style.display = 'flex';
+  } catch (err) {
+    addLog('error', `Transmission failed: ${err.message}`);
   }
 
   updateTransmitButtonState();
@@ -446,6 +484,43 @@ function renderPeersGrid() {
       </div>
     `;
   }).join('');
+}
+
+// Render Chat Conversation history
+function renderChatMessages() {
+  if (!state.selectedPeerId) {
+    els.chatMessages.innerHTML = `<div class="empty-state-text">Select a device to start chatting</div>`;
+    return;
+  }
+
+  const selectedPeer = state.devices.find(d => d.id === state.selectedPeerId);
+  const peerName = selectedPeer ? selectedPeer.alias : 'Peer';
+
+  // Filter messages exchanged with selected peer
+  const conversation = state.chatHistory.filter(msg => {
+    const isSentToSelected = msg.sender.id === state.me.id && msg.receiverId === state.selectedPeerId;
+    const isReceivedFromSelected = msg.sender.id === state.selectedPeerId;
+    return isSentToSelected || isReceivedFromSelected;
+  });
+
+  if (conversation.length === 0) {
+    els.chatMessages.innerHTML = `<div class="empty-state-text">No messages yet with <strong>${escapeHtml(peerName)}</strong>.<br>Send a message to start conversation!</div>`;
+    return;
+  }
+
+  els.chatMessages.innerHTML = conversation.map(msg => {
+    const isSent = msg.sender.id === state.me.id;
+    const timeStr = new Date(msg.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return `
+      <div class="chat-bubble ${isSent ? 'sent' : 'received'}">
+        <div class="chat-bubble-text">${escapeHtml(msg.text)}</div>
+        <div class="chat-bubble-meta">${timeStr}</div>
+      </div>
+    `;
+  }).join('');
+
+  // Auto scroll to latest message
+  els.chatMessages.scrollTop = els.chatMessages.scrollHeight;
 }
 
 // Expose peer select helper to global scope for HTML inline onclick

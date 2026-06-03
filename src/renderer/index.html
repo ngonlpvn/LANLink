@@ -147,9 +147,17 @@
         </div>
 
         <div class="tab-content" id="tabTextContent" style="display: none;">
-          <form id="textMessageForm" class="text-form">
-            <textarea id="textMessageInput" placeholder="Type a message or paste a URL to share instantly..." required autocomplete="off"></textarea>
-          </form>
+          <div class="chat-container" id="chatContainer">
+            <div class="chat-messages" id="chatMessages">
+              <div class="empty-state-text">Select a device to start chatting</div>
+            </div>
+            <form id="textMessageForm" class="chat-composer">
+              <input id="textMessageInput" type="text" placeholder="Type a LAN message..." required autocomplete="off" disabled>
+              <button id="sendMsgBtn" class="btn btn-primary btn-icon-send" type="submit" disabled>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+              </button>
+            </form>
+          </div>
         </div>
 
         <!-- Transmission Footer: Shows target status & send button -->

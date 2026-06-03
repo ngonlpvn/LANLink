@@ -238,12 +238,38 @@ function startHttpServer() {
               });
             }
 
+            // Check if this is a chat message (text.txt and size < 64KB)
+            const isTextMessage = Object.values(files).every(f => f.fileName === 'text.txt' && f.fileType === 'text/plain' && f.size < 65536);
+
+            if (isTextMessage) {
+              // Auto-accept text messages to make chat feel instant and fluid
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({
+                sessionId,
+                files: fileTokens
+              }));
+
+              const session = {
+                sessionId,
+                sender,
+                files: filesMap,
+                res: null, // no pending HTTP response to resolve later
+                fileTokens,
+                isText: true
+              };
+
+              activeIncomingSession = session;
+              pendingIncomingSessions.set(sessionId, session);
+              return;
+            }
+
             const session = {
               sessionId,
               sender,
               files: filesMap,
               res,
-              fileTokens
+              fileTokens,
+              isText: false
             };
 
             activeIncomingSession = session;
@@ -283,6 +309,41 @@ function startHttpServer() {
           if (!file || file.token !== token) {
             res.writeHead(403);
             res.end('Invalid File Token');
+            return;
+          }
+
+          // Handle in-memory chat message buffer instead of disk write
+          if (session.isText) {
+            let bodyBuffer = [];
+            req.on('data', (chunk) => {
+              bodyBuffer.push(chunk);
+            });
+            req.on('end', () => {
+              const textContent = Buffer.concat(bodyBuffer).toString('utf8');
+              
+              // Emit chat:message to renderer
+              sendToRenderer('chat:message', {
+                id: `${Date.now()}-${Math.random()}`,
+                sender: { id: session.sender.fingerprint || session.sender.id, alias: session.sender.alias },
+                receiverId: device.id,
+                text: textContent,
+                time: Date.now()
+              });
+              
+              // Clean up session
+              activeIncomingSession = null;
+              pendingIncomingSessions.delete(sessionId);
+              
+              res.writeHead(200);
+              res.end('OK');
+            });
+            
+            req.on('error', (err) => {
+              activeIncomingSession = null;
+              pendingIncomingSessions.delete(sessionId);
+              res.writeHead(500);
+              res.end('Error');
+            });
             return;
           }
 
@@ -953,6 +1014,7 @@ ipcMain.handle('chat:send', async (_event, payload) => {
           sendToRenderer('chat:message', {
             id: `${Date.now()}-${Math.random()}`,
             sender: { id: device.id, alias: device.alias },
+            receiverId: targetId,
             text,
             time: Date.now()
           });
