@@ -19,11 +19,15 @@ contextBridge.exposeInMainWorld('lanlink', {
   connectPeer: (ip) => ipcRenderer.invoke('lan:connect-peer', ip),
   getInterfaces: () => ipcRenderer.invoke('app:get-interfaces'),
   setActiveIp: (ip) => ipcRenderer.invoke('app:set-active-ip', ip),
+  rescan: () => ipcRenderer.invoke('lan:rescan'),
+  acceptInvite: (sessionId) => ipcRenderer.invoke('lan:accept-invite', sessionId),
+  declineInvite: (sessionId) => ipcRenderer.invoke('lan:decline-invite', sessionId),
   onStatus: (callback) => subscribe('lan:status', callback),
   onDevices: (callback) => subscribe('lan:devices', callback),
   onLog: (callback) => subscribe('lan:log', callback),
   onMessage: (callback) => subscribe('chat:message', callback),
   onFileProgress: (callback) => subscribe('file:progress', callback),
   onSignal: (callback) => subscribe('webrtc:signal', callback),
-  onCallEvent: (callback) => subscribe('call:event', callback)
+  onCallEvent: (callback) => subscribe('call:event', callback),
+  onInvite: (callback) => subscribe('lan:invite', callback)
 });

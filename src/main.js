@@ -3,40 +3,42 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const http = require('http');
-const { Server } = require('socket.io');
-const { io: Client } = require('socket.io-client');
+const dgram = require('dgram');
+const crypto = require('crypto');
+const url = require('url');
 
-const APP_PORT = Number(process.env.LANLINK_PORT || 32150);
-const PING_INTERVAL_MS = 3000;
-const OFFLINE_TIMEOUT_MS = 12000;
-const SOCKET_ACK_TIMEOUT_MS = 5000;
+// Port configurations
+let APP_PORT = 53317;
+const UDP_PORT = 53317;
+const MULTICAST_ADDR = '224.0.0.167';
 
 let mainWindow;
 let httpServer;
-let ioServer;
-let socketClient;
-let pingTimer;
-let offlineTimer;
-let lastPingLogAt = 0;
-let role = 'Ready';
-let hostInfo = null;
-let userSelectedIp = null;
-let pairedPeerIp = null;
-let hostReadyPromise = null;
+let udpSocket;
+let scanTimer;
+let announceTimer;
+let cleanupTimer;
 
 const device = createLocalDevice();
-const devices = new Map();
-const pendingFiles = new Map();
+const devices = new Map(); // fingerprint -> device info
+const pendingIncomingSessions = new Map(); // sessionId -> session object
+const pendingOutgoingSessions = new Map(); // sessionId -> session object
+let activeIncomingSession = null; // Currently active receive session
 
 function createLocalDevice() {
+  const hostname = os.hostname();
+  const id = crypto.createHash('sha256').update(`${hostname}-${Date.now()}-${Math.random()}`).digest('hex').slice(0, 16);
   return {
-    id: `${os.hostname()}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    name: os.hostname(),
-    ip: getLanIp(),
-    role: 'Ready',
+    id,
+    name: hostname,
+    alias: `${hostname} (LANLink)`,
+    ip: '127.0.0.1',
+    port: APP_PORT,
+    deviceModel: os.type() === 'Darwin' ? 'macOS' : 'Windows',
+    deviceType: 'desktop',
+    protocol: 'http',
+    download: false,
     status: 'online',
-    rtt: 0,
-    connectedAt: Date.now(),
     lastSeen: Date.now()
   };
 }
@@ -45,7 +47,8 @@ function getNetworkInterfaces() {
   const nets = os.networkInterfaces();
   const list = [];
   for (const [name, entries] of Object.entries(nets)) {
-    if (/virtual|vbox|vmnet|docker|vpn|wsl|p2p/i.test(name)) continue;
+    // Filter out loopbacks, virtual, VPN, Docker, and other non-physical interfaces
+    if (/virtual|vbox|vmnet|docker|vpn|wsl|p2p|loopback|gif|stf|bridge/i.test(name)) continue;
     for (const entry of entries || []) {
       if (entry.family === 'IPv4' && !entry.internal) {
         let type = 'LAN';
@@ -64,7 +67,7 @@ function getNetworkInterfaces() {
     }
   }
 
-  // Sort: prioritize type === 'LAN' first, then 'Wi-Fi'
+  // Prioritize Ethernet (LAN) then Wi-Fi
   return list.sort((a, b) => {
     if (a.type !== b.type) return a.type === 'LAN' ? -1 : 1;
     return a.name.localeCompare(b.name);
@@ -72,14 +75,27 @@ function getNetworkInterfaces() {
 }
 
 function getLanIp() {
-  if (userSelectedIp) {
-    const list = getNetworkInterfaces();
-    if (list.some(i => i.address === userSelectedIp)) {
-      return userSelectedIp;
-    }
-  }
   const list = getNetworkInterfaces();
   return list[0]?.address || '127.0.0.1';
+}
+
+function getSubnetIps(ip, netmask) {
+  const ips = [];
+  const ipParts = ip.split('.').map(Number);
+  const maskParts = netmask.split('.').map(Number);
+
+  if (ipParts.length !== 4 || maskParts.length !== 4) return ips;
+
+  // We optimize for the standard /24 subnet scanning, which covers 99% of home networks.
+  // This is safe, extremely fast, and avoids scanning 65k IPs on /16 subnets.
+  const prefix = ipParts.slice(0, 3).join('.');
+  for (let i = 1; i <= 254; i++) {
+    const candidate = `${prefix}.${i}`;
+    if (candidate !== ip) {
+      ips.push(candidate);
+    }
+  }
+  return ips;
 }
 
 function sendToRenderer(channel, payload) {
@@ -92,20 +108,879 @@ function log(type, message, meta = {}) {
   sendToRenderer('lan:log', { time: Date.now(), type, message, meta });
 }
 
-function ackOk(ack, payload = {}) {
-  if (typeof ack === 'function') ack({ ok: true, ...payload });
+function emitDevices() {
+  const list = Array.from(devices.values())
+    .filter(d => d.id !== device.id)
+    .map(d => ({
+      ...d,
+      status: Date.now() - d.lastSeen < 12000 ? 'online' : 'offline'
+    }));
+  sendToRenderer('lan:devices', list);
 }
 
-function ackFail(ack, error) {
-  if (typeof ack === 'function') ack({ ok: false, error: error?.message || String(error) });
+function upsertDevice(remote) {
+  if (remote.id === device.id || remote.fingerprint === device.id) return;
+  const id = remote.id || remote.fingerprint;
+  const current = devices.get(id) || {};
+  devices.set(id, {
+    ...current,
+    id,
+    alias: remote.alias || remote.name || 'Unknown Device',
+    deviceModel: remote.deviceModel || 'Unknown',
+    deviceType: remote.deviceType || 'desktop',
+    ip: remote.ip,
+    port: remote.port || 53317,
+    protocol: remote.protocol || 'http',
+    download: remote.download || false,
+    lastSeen: Date.now(),
+    status: 'online'
+  });
+  emitDevices();
 }
 
-function emitWithAck(event, payload, timeout = SOCKET_ACK_TIMEOUT_MS) {
-  if (!socketClient?.connected) {
-    return Promise.reject(new Error('Not connected to a host'));
+// HTTP Helper to parse JSON body
+function parseJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on('error', (err) => reject(err));
+  });
+}
+
+// HTTP Server implementation (LocalSend compatible)
+function startHttpServer() {
+  return new Promise((resolve) => {
+    const tryBind = (port) => {
+      httpServer = http.createServer((req, res) => {
+        const parsedUrl = url.parse(req.url, true);
+        const pathname = parsedUrl.pathname;
+        const method = req.method;
+
+        // Enable CORS
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+        if (method === 'OPTIONS') {
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+
+        // POST /api/localsend/v2/register
+        if (pathname === '/api/localsend/v2/register' && method === 'POST') {
+          parseJsonBody(req).then((body) => {
+            const clientIp = req.socket.remoteAddress.replace(/^.*:/, ''); // IPv4 mapping format fix
+            upsertDevice({ ...body, ip: clientIp });
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              alias: device.alias,
+              version: '2.0',
+              deviceModel: device.deviceModel,
+              deviceType: device.deviceType,
+              fingerprint: device.id,
+              port: device.port,
+              protocol: 'http',
+              download: false
+            }));
+          }).catch(err => {
+            res.writeHead(400);
+            res.end('Bad Request');
+          });
+        }
+        // GET /api/localsend/v2/info
+        else if (pathname === '/api/localsend/v2/info' && method === 'GET') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            alias: device.alias,
+            version: '2.0',
+            deviceModel: device.deviceModel,
+            deviceType: device.deviceType,
+            fingerprint: device.id,
+            port: device.port,
+            protocol: 'http',
+            download: false
+          }));
+        }
+        // POST /api/localsend/v2/prepare-upload
+        else if (pathname === '/api/localsend/v2/prepare-upload' && method === 'POST') {
+          parseJsonBody(req).then((body) => {
+            if (activeIncomingSession) {
+              res.writeHead(409); // Conflict
+              res.end('Another session is active');
+              return;
+            }
+
+            const sender = body.info;
+            const files = body.files;
+            const clientIp = req.socket.remoteAddress.replace(/^.*:/, '');
+            sender.ip = clientIp;
+
+            const sessionId = crypto.randomBytes(16).toString('hex');
+            const fileTokens = {};
+            const filesMap = new Map();
+
+            for (const [fileId, fileInfo] of Object.entries(files)) {
+              const token = crypto.randomBytes(16).toString('hex');
+              fileTokens[fileId] = token;
+              filesMap.set(fileId, {
+                ...fileInfo,
+                token,
+                received: 0,
+                status: 'pending'
+              });
+            }
+
+            const session = {
+              sessionId,
+              sender,
+              files: filesMap,
+              res,
+              fileTokens
+            };
+
+            activeIncomingSession = session;
+            pendingIncomingSessions.set(sessionId, session);
+
+            // Notify renderer of incoming invite
+            sendToRenderer('lan:invite', {
+              sessionId,
+              sender: {
+                alias: sender.alias,
+                deviceModel: sender.deviceModel,
+                deviceType: sender.deviceType,
+                ip: sender.ip
+              },
+              files: Object.values(files)
+            });
+
+            log('warning', `Incoming transfer request from ${sender.alias} (${Object.keys(files).length} files)`);
+
+          }).catch(err => {
+            res.writeHead(400);
+            res.end('Bad Request');
+          });
+        }
+        // POST /api/localsend/v2/upload
+        else if (pathname === '/api/localsend/v2/upload' && method === 'POST') {
+          const { sessionId, fileId, token } = parsedUrl.query;
+          const session = activeIncomingSession;
+
+          if (!session || session.sessionId !== sessionId) {
+            res.writeHead(403);
+            res.end('Invalid Session');
+            return;
+          }
+
+          const file = session.files.get(fileId);
+          if (!file || file.token !== token) {
+            res.writeHead(403);
+            res.end('Invalid File Token');
+            return;
+          }
+
+          const dir = path.join(app.getPath('downloads'), 'LANLinkReceived');
+          fs.mkdirSync(dir, { recursive: true });
+          const safeName = file.fileName.replace(/[\\/:*?"<>|]/g, '_');
+          const filePath = path.join(dir, `${Date.now()}-${safeName}`);
+
+          const writeStream = fs.createWriteStream(filePath);
+          file.status = 'uploading';
+          file.filePath = filePath;
+
+          let received = 0;
+          const startedAt = Date.now();
+          let lastReportedAt = Date.now();
+
+          req.on('data', (chunk) => {
+            writeStream.write(chunk);
+            received += chunk.length;
+            file.received = received;
+
+            const now = Date.now();
+            if (now - lastReportedAt >= 150) {
+              lastReportedAt = now;
+              const elapsed = (now - startedAt) / 1000 || 0.001;
+              const speedMbps = (received * 8) / elapsed / 1000000;
+              sendToRenderer('file:progress', {
+                transferId: sessionId,
+                receiverId: device.id,
+                senderId: session.sender.fingerprint,
+                name: file.fileName,
+                size: file.size,
+                progress: (received / file.size) * 100,
+                speedMbps,
+                avgSpeedMbps: speedMbps,
+                status: 'receiving'
+              });
+            }
+          });
+
+          req.on('end', () => {
+            writeStream.end();
+            file.status = 'completed';
+            log('success', `File received: ${file.fileName}`);
+
+            sendToRenderer('file:progress', {
+              transferId: sessionId,
+              receiverId: device.id,
+              senderId: session.sender.fingerprint,
+              name: file.fileName,
+              size: file.size,
+              progress: 100,
+              speedMbps: 0,
+              avgSpeedMbps: 0,
+              status: 'completed',
+              filePath
+            });
+
+            // Check if all files in the session are completed
+            let allFinished = true;
+            for (const f of session.files.values()) {
+              if (f.status !== 'completed' && f.status !== 'failed') {
+                allFinished = false;
+                break;
+              }
+            }
+
+            if (allFinished) {
+              log('success', 'All file transfers completed');
+              activeIncomingSession = null;
+              pendingIncomingSessions.delete(sessionId);
+            }
+
+            res.writeHead(200);
+            res.end('OK');
+          });
+
+          req.on('error', (err) => {
+            writeStream.end();
+            file.status = 'failed';
+            log('error', `Error receiving file ${file.fileName}: ${err.message}`);
+            res.writeHead(500);
+            res.end('Internal Server Error');
+          });
+        }
+        // POST /api/localsend/v2/cancel
+        else if (pathname === '/api/localsend/v2/cancel' && method === 'POST') {
+          const { sessionId } = parsedUrl.query;
+          const session = activeIncomingSession;
+
+          if (session && session.sessionId === sessionId) {
+            log('warning', `Transfer canceled by sender`);
+            activeIncomingSession = null;
+            pendingIncomingSessions.delete(sessionId);
+            sendToRenderer('file:progress', {
+              transferId: sessionId,
+              status: 'canceled'
+            });
+          }
+          res.writeHead(200);
+          res.end('OK');
+        } else {
+          res.writeHead(404);
+          res.end('Not Found');
+        }
+      });
+
+      httpServer.listen(port, '0.0.0.0', () => {
+        device.port = port;
+        APP_PORT = port;
+        log('success', `Local HTTP server running on port ${port}`);
+        resolve(port);
+      });
+
+      httpServer.on('error', (err) => {
+        if (err.code === 'EADDRINUSE' && port < 53327) {
+          log('info', `Port ${port} in use, trying next...`);
+          tryBind(port + 1);
+        } else {
+          log('error', `Failed to start HTTP server: ${err.message}`);
+          resolve(null);
+        }
+      });
+    };
+
+    tryBind(APP_PORT);
+  });
+}
+
+// UDP Multicast setup
+function startUdpDiscovery() {
+  udpSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+
+  udpSocket.on('message', (buffer, rinfo) => {
+    try {
+      const msg = JSON.parse(buffer.toString());
+      if (msg.fingerprint === device.id) return; // ignore self
+      
+      const remoteIp = rinfo.address;
+      upsertDevice({ ...msg, ip: remoteIp });
+
+      // If the incoming packet is an active announcement request, respond back so they see us too
+      if (msg.announcement === true) {
+        respondToUdpAnnouncement(remoteIp, msg.port);
+      }
+    } catch (e) {
+      // Ignore malformed packets
+    }
+  });
+
+  udpSocket.on('error', (err) => {
+    log('error', `UDP discovery error: ${err.message}`);
+  });
+
+  udpSocket.bind(UDP_PORT, () => {
+    try {
+      udpSocket.setBroadcast(true);
+      // Join multicast group on all active physical interfaces
+      const interfaces = getNetworkInterfaces();
+      for (const iface of interfaces) {
+        try {
+          udpSocket.addMembership(MULTICAST_ADDR, iface.address);
+        } catch (e) {
+          // Multicast join failed on this interface (e.g. not multicast-capable)
+        }
+      }
+      log('info', 'UDP Multicast discovery listening');
+    } catch (e) {
+      log('error', `Failed to initialize UDP Multicast: ${e.message}`);
+    }
+  });
+}
+
+function respondToUdpAnnouncement(ip, port) {
+  try {
+    const payload = Buffer.from(JSON.stringify({
+      alias: device.alias,
+      version: '2.0',
+      deviceModel: device.deviceModel,
+      deviceType: device.deviceType,
+      fingerprint: device.id,
+      port: device.port,
+      protocol: 'http',
+      announcement: false
+    }));
+    const client = dgram.createSocket('udp4');
+    client.send(payload, 0, payload.length, port, ip, () => {
+      client.close();
+    });
+  } catch (e) {
+    // Ignore send failures
   }
-  return socketClient.timeout(timeout).emitWithAck(event, payload);
 }
+
+function sendUdpAnnouncement() {
+  if (!udpSocket) return;
+
+  const payload = Buffer.from(JSON.stringify({
+    alias: device.alias,
+    version: '2.0',
+    deviceModel: device.deviceModel,
+    deviceType: device.deviceType,
+    fingerprint: device.id,
+    port: device.port,
+    protocol: 'http',
+    announcement: true
+  }));
+
+  const interfaces = getNetworkInterfaces();
+  for (const iface of interfaces) {
+    try {
+      udpSocket.setMulticastInterface(iface.address);
+      udpSocket.send(payload, 0, payload.length, UDP_PORT, MULTICAST_ADDR, (err) => {
+        if (err) {
+          // Ignore individual interface send errors (e.g., if link is down)
+        }
+      });
+    } catch (e) {
+      // Fail silently for virtual/inactive interfaces
+    }
+  }
+}
+
+// Active TCP Subnet Scanner
+async function scanSubnets() {
+  log('info', 'Starting TCP subnet scanning...');
+  const interfaces = getNetworkInterfaces();
+  
+  const scanPromises = [];
+  const scannedIps = new Set();
+
+  for (const iface of interfaces) {
+    const ips = getSubnetIps(iface.address, iface.netmask);
+    log('info', `Scanning interface ${iface.name} (${iface.address}) - ${ips.length} IPs...`);
+    ips.forEach(ip => scannedIps.add(ip));
+  }
+
+  const ipList = Array.from(scannedIps);
+  
+  // Implement a batch scanner to prevent socket exhaustion
+  const concurrencyLimit = 40;
+  for (let i = 0; i < ipList.length; i += concurrencyLimit) {
+    const batch = ipList.slice(i, i + concurrencyLimit);
+    const batchPromises = batch.map(ip => checkPeerRegistration(ip));
+    await Promise.all(batchPromises);
+  }
+  
+  log('success', 'Subnet scanning completed.');
+}
+
+function checkPeerRegistration(ip) {
+  return new Promise((resolve) => {
+    const payload = JSON.stringify({
+      alias: device.alias,
+      version: '2.0',
+      deviceModel: device.deviceModel,
+      deviceType: device.deviceType,
+      fingerprint: device.id,
+      port: device.port,
+      protocol: 'http',
+      download: false
+    });
+
+    const req = http.request({
+      hostname: ip,
+      port: 53317, // default LocalSend port
+      path: '/api/localsend/v2/register',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload)
+      },
+      timeout: 800
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          try {
+            const info = JSON.parse(data);
+            upsertDevice({ ...info, ip });
+            log('success', `Discovered peer via scan: ${info.alias} at ${ip}`);
+          } catch (e) {
+            // Ignore JSON parsing errors
+          }
+        }
+        resolve();
+      });
+    });
+
+    req.on('error', () => {
+      resolve(); // ignore connection errors
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      resolve();
+    });
+
+    req.write(payload);
+    req.end();
+  });
+}
+
+function startLanRuntime() {
+  device.ip = getLanIp();
+  device.status = 'online';
+  device.lastSeen = Date.now();
+  devices.set(device.id, device);
+
+  startHttpServer().then(() => {
+    startUdpDiscovery();
+    
+    // Broadcast announcement immediately and then periodically
+    sendUdpAnnouncement();
+    announceTimer = setInterval(sendUdpAnnouncement, 8000);
+
+    // Initial subnet scan
+    scanSubnets();
+    scanTimer = setInterval(scanSubnets, 40000); // scan subnets every 40s
+  });
+
+  // Cleanup offline devices timer
+  cleanupTimer = setInterval(() => {
+    let changed = false;
+    for (const [id, d] of devices.entries()) {
+      if (id === device.id) continue;
+      if (Date.now() - d.lastSeen > 16000 && d.status === 'online') {
+        d.status = 'offline';
+        changed = true;
+        log('warning', `Device went offline: ${d.alias}`);
+      }
+    }
+    if (changed) emitDevices();
+  }, 3000);
+}
+
+function shutdownRuntime() {
+  clearInterval(announceTimer);
+  clearInterval(scanTimer);
+  clearInterval(cleanupTimer);
+
+  if (httpServer) {
+    httpServer.close();
+    httpServer = null;
+  }
+
+  if (udpSocket) {
+    udpSocket.close();
+    udpSocket = null;
+  }
+}
+
+// IPC Handlers
+ipcMain.handle('app:get-info', () => ({
+  id: device.id,
+  name: device.alias,
+  ip: getLanIp(),
+  role: 'Peer',
+  port: device.port
+}));
+
+ipcMain.handle('app:get-interfaces', () => getNetworkInterfaces());
+
+ipcMain.handle('app:set-active-ip', (_event, ip) => {
+  userSelectedIp = ip;
+  device.ip = getLanIp();
+  upsertDevice(device);
+  sendUdpAnnouncement();
+  log('info', `Active IP configured: ${device.ip}`);
+  return device.ip;
+});
+
+ipcMain.handle('dialog:pick-file', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, { properties: ['openFile'] });
+  if (result.canceled || !result.filePaths[0]) return null;
+  const filePath = result.filePaths[0];
+  const stat = fs.statSync(filePath);
+  return { path: filePath, name: path.basename(filePath), size: stat.size };
+});
+
+// IPC Accept/Decline transfer invites
+ipcMain.handle('lan:accept-invite', (_event, sessionId) => {
+  const session = pendingIncomingSessions.get(sessionId);
+  if (!session) return { ok: false, error: 'Session not found' };
+
+  session.res.writeHead(200, { 'Content-Type': 'application/json' });
+  session.res.end(JSON.stringify({
+    sessionId: session.sessionId,
+    files: session.fileTokens
+  }));
+
+  log('info', `Accepted transfer session ${sessionId}`);
+  return { ok: true };
+});
+
+ipcMain.handle('lan:decline-invite', (_event, sessionId) => {
+  const session = pendingIncomingSessions.get(sessionId);
+  if (!session) return { ok: false, error: 'Session not found' };
+
+  session.res.writeHead(403);
+  session.res.end('Declined by receiver');
+
+  pendingIncomingSessions.delete(sessionId);
+  if (activeIncomingSession?.sessionId === sessionId) {
+    activeIncomingSession = null;
+  }
+
+  log('info', `Declined transfer session ${sessionId}`);
+  return { ok: true };
+});
+
+ipcMain.handle('lan:rescan', async () => {
+  sendUdpAnnouncement();
+  await scanSubnets();
+  return { ok: true };
+});
+
+// Send file (REST based)
+ipcMain.handle('file:send', async (_event, payload) => {
+  const { path: filePath, targets } = payload;
+  if (!targets || !targets[0]) throw new Error('No targets selected');
+  const targetId = targets[0];
+  const peer = devices.get(targetId);
+  if (!peer) throw new Error('Peer not found or offline');
+
+  const stat = fs.statSync(filePath);
+  const fileName = path.basename(filePath);
+  const fileId = crypto.randomBytes(8).toString('hex');
+
+  log('info', `Initiating transfer of ${fileName} to ${peer.alias}...`);
+
+  // Step 1: Prepare upload
+  const preparePayload = JSON.stringify({
+    info: {
+      alias: device.alias,
+      version: '2.0',
+      deviceModel: device.deviceModel,
+      deviceType: device.deviceType,
+      fingerprint: device.id,
+      port: device.port,
+      protocol: 'http',
+      download: false
+    },
+    files: {
+      [fileId]: {
+        id: fileId,
+        fileName,
+        size: stat.size,
+        fileType: 'application/octet-stream'
+      }
+    }
+  });
+
+  const prepareRes = await new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: peer.ip,
+      port: peer.port,
+      path: '/api/localsend/v2/prepare-upload',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(preparePayload)
+      },
+      timeout: 15000 // give the receiver time to accept
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          try {
+            resolve(JSON.parse(data));
+          } catch (e) {
+            reject(new Error('Invalid response from peer'));
+          }
+        } else if (res.statusCode === 403) {
+          reject(new Error('Transfer declined by peer'));
+        } else if (res.statusCode === 409) {
+          reject(new Error('Peer is busy with another transfer'));
+        } else {
+          reject(new Error(`Peer rejected with code ${res.statusCode}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Request timed out'));
+    });
+
+    req.write(preparePayload);
+    req.end();
+  });
+
+  const { sessionId, files: fileTokens } = prepareRes;
+  const token = fileTokens[fileId];
+  if (!token) throw new Error('Receiver did not authorize the file upload');
+
+  log('info', `File transfer approved. Starting binary upload...`);
+
+  // Step 2: Upload file
+  return new Promise((resolve, reject) => {
+    const uploadUrl = `/api/localsend/v2/upload?sessionId=${sessionId}&fileId=${fileId}&token=${token}`;
+    const fileStream = fs.createReadStream(filePath);
+    
+    const req = http.request({
+      hostname: peer.ip,
+      port: peer.port,
+      path: uploadUrl,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': stat.size
+      }
+    }, (res) => {
+      res.on('data', () => {});
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          log('success', `File ${fileName} sent successfully`);
+          sendToRenderer('file:progress', {
+            transferId: sessionId,
+            receiverId: targetId,
+            senderId: device.id,
+            name: fileName,
+            size: stat.size,
+            progress: 100,
+            speedMbps: 0,
+            avgSpeedMbps: 0,
+            status: 'completed'
+          });
+          resolve({ ok: true });
+        } else {
+          reject(new Error(`Upload failed with code ${res.statusCode}`));
+        }
+      });
+    });
+
+    req.on('error', (err) => {
+      fileStream.destroy();
+      reject(err);
+    });
+
+    let uploadedBytes = 0;
+    const startedAt = Date.now();
+    let lastReportedAt = Date.now();
+
+    fileStream.on('data', (chunk) => {
+      uploadedBytes += chunk.length;
+      
+      const now = Date.now();
+      if (now - lastReportedAt >= 150) {
+        lastReportedAt = now;
+        const elapsed = (now - startedAt) / 1000 || 0.001;
+        const speedMbps = (uploadedBytes * 8) / elapsed / 1000000;
+        sendToRenderer('file:progress', {
+          transferId: sessionId,
+          receiverId: targetId,
+          senderId: device.id,
+          name: fileName,
+          size: stat.size,
+          progress: (uploadedBytes / stat.size) * 100,
+          speedMbps,
+          avgSpeedMbps: speedMbps,
+          status: 'sending'
+        });
+      }
+    });
+
+    fileStream.on('end', () => {
+      req.end();
+    });
+
+    fileStream.pipe(req);
+  });
+});
+
+// Send quick text message
+ipcMain.handle('chat:send', async (_event, payload) => {
+  const { text, targets } = payload;
+  if (!targets || !targets[0]) throw new Error('No targets selected');
+  const targetId = targets[0];
+  const peer = devices.get(targetId);
+  if (!peer) throw new Error('Peer not found or offline');
+
+  const textBytes = Buffer.from(text, 'utf8');
+  const fileId = crypto.randomBytes(8).toString('hex');
+  const fileName = 'text.txt';
+
+  log('info', `Sending text message to ${peer.alias}...`);
+
+  // Step 1: Prepare upload
+  const preparePayload = JSON.stringify({
+    info: {
+      alias: device.alias,
+      version: '2.0',
+      deviceModel: device.deviceModel,
+      deviceType: device.deviceType,
+      fingerprint: device.id,
+      port: device.port,
+      protocol: 'http',
+      download: false
+    },
+    files: {
+      [fileId]: {
+        id: fileId,
+        fileName,
+        size: textBytes.length,
+        fileType: 'text/plain'
+      }
+    }
+  });
+
+  const prepareRes = await new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: peer.ip,
+      port: peer.port,
+      path: '/api/localsend/v2/prepare-upload',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(preparePayload)
+      },
+      timeout: 8000
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          try {
+            resolve(JSON.parse(data));
+          } catch (e) {
+            reject(new Error('Invalid response'));
+          }
+        } else if (res.statusCode === 403) {
+          reject(new Error('Message declined by peer'));
+        } else {
+          reject(new Error(`Rejected with status ${res.statusCode}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.write(preparePayload);
+    req.end();
+  });
+
+  const { sessionId, files: fileTokens } = prepareRes;
+  const token = fileTokens[fileId];
+  if (!token) throw new Error('Not authorized by peer');
+
+  // Step 2: Upload raw text bytes
+  return new Promise((resolve, reject) => {
+    const uploadUrl = `/api/localsend/v2/upload?sessionId=${sessionId}&fileId=${fileId}&token=${token}`;
+    const req = http.request({
+      hostname: peer.ip,
+      port: peer.port,
+      path: uploadUrl,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain',
+        'Content-Length': textBytes.length
+      }
+    }, (res) => {
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          // Render locally in chat history
+          sendToRenderer('chat:message', {
+            id: `${Date.now()}-${Math.random()}`,
+            sender: { id: device.id, alias: device.alias },
+            text,
+            time: Date.now()
+          });
+          resolve({ ok: true });
+        } else {
+          reject(new Error(`Failed to send message: ${res.statusCode}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.write(textBytes);
+    req.end();
+  });
+});
+
+// Stub WebRTC calls (since LocalSend is file-sharing only, we bypass signaling)
+ipcMain.handle('webrtc:signal', () => ({ ok: true }));
+ipcMain.handle('call:event', () => ({ ok: true }));
+ipcMain.handle('lan:connect-peer', async (_event, ip) => {
+  // Let the user add a peer manually by IP
+  const peerIp = String(ip || '').trim();
+  if (!isValidIpv4(peerIp)) throw new Error('Invalid IP Address');
+  
+  log('info', `Manually probing peer at ${peerIp}...`);
+  await checkPeerRegistration(peerIp);
+  return { ok: true, ip: peerIp };
+});
 
 function isValidIpv4(ip) {
   const parts = String(ip || '').trim().split('.');
@@ -116,51 +991,7 @@ function isValidIpv4(ip) {
   });
 }
 
-function publicDevices() {
-  const local = devices.get(device.id) || device;
-  const remotes = Array.from(devices.values())
-    .filter((item) => item.id !== device.id)
-    .filter((item) => {
-      if (pairedPeerIp) return item.ip === pairedPeerIp;
-      return item.status === 'online';
-    })
-    .sort((a, b) => {
-      if (a.status !== b.status) return a.status === 'online' ? -1 : 1;
-      return (b.lastSeen || 0) - (a.lastSeen || 0);
-    });
-  const pair = [local];
-  if (remotes[0]) pair.push(remotes[0]);
-  return pair.sort((a, b) => {
-    if (a.status !== b.status) return a.status === 'online' ? -1 : 1;
-    return a.name.localeCompare(b.name);
-  });
-}
-
-function emitDevices() {
-  const list = publicDevices();
-  sendToRenderer('lan:devices', list);
-  if (ioServer) ioServer.emit('devices:update', list);
-}
-
-function upsertDevice(next) {
-  const current = devices.get(next.id) || {};
-  const wasOnline = current.status === 'online';
-  const isOnline = (next.status || 'online') === 'online';
-
-  devices.set(next.id, {
-    ...current,
-    ...next,
-    lastSeen: Date.now(),
-    status: next.status || 'online'
-  });
-
-  if (!wasOnline && isOnline && next.id !== device.id) {
-    log('success', `Device online: ${next.name}`);
-  }
-
-  emitDevices();
-}
-
+// Window creation & management
 async function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1440,
@@ -193,535 +1024,3 @@ app.on('window-all-closed', () => {
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow();
 });
-
-function startLanRuntime() {
-  device.ip = getLanIp();
-  device.status = 'online';
-  device.role = 'Host';
-  device.lastSeen = Date.now();
-  devices.set(device.id, device);
-  log('info', 'Manual peer mode started');
-  becomeHost();
-}
-
-function stopHostServices() {
-  clearInterval(pingTimer);
-  clearInterval(offlineTimer);
-  socketClient?.close();
-  socketClient = null;
-  ioServer?.close();
-  ioServer = null;
-  httpServer?.close();
-  httpServer = null;
-}
-
-function becomeHost() {
-  if (httpServer || ioServer) return hostReadyPromise || Promise.resolve();
-  hostReadyPromise = new Promise((resolve) => {
-    hostInfo = { ip: device.ip, port: APP_PORT, id: device.id, name: device.name };
-    role = 'Host';
-    device.role = 'Host';
-    upsertDevice(device);
-
-    httpServer = http.createServer();
-    ioServer = new Server(httpServer, {
-      cors: { origin: '*' },
-      maxHttpBufferSize: 1e8
-    });
-
-    ioServer.on('connection', (socket) => {
-    let registeredId = null;
-
-    socket.on('device:hello', (hello) => {
-      const current = devices.get(hello.id);
-      const shouldLogConnection = hello.id !== device.id && (!current || current.status !== 'online');
-      registeredId = hello.id;
-      upsertDevice({ ...hello, role: hello.id === device.id ? 'Host' : 'Client', status: 'online' });
-      socket.join(hello.id);
-      socket.emit('devices:update', publicDevices());
-      socket.broadcast.emit('devices:update', publicDevices());
-      if (shouldLogConnection) log('success', `Client connected: ${hello.name}`);
-    });
-
-    socket.on('message:send', (payload, ack) => {
-      try {
-        const message = { ...payload, id: `${Date.now()}-${Math.random()}`, time: Date.now() };
-        const delivered = routeToTargets('message:received', message.targets, message);
-        log('info', 'Message sent', { targets: message.targets, delivered });
-        ackOk(ack, { delivered });
-      } catch (error) {
-        log('error', 'Message send failed', { error: error.message });
-        ackFail(ack, error);
-      }
-    });
-
-    socket.on('file:start', (payload, ack) => {
-      try {
-        const delivered = routeToTargets('file:start', payload.targets, payload);
-        log('info', `File transfer started: ${payload.name}`);
-        ackOk(ack, { delivered });
-      } catch (error) {
-        ackFail(ack, error);
-      }
-    });
-
-    socket.on('file:chunk', (payload, ack) => {
-      try {
-        const delivered = routeToTargets('file:chunk', payload.targets, payload);
-        ackOk(ack, { delivered });
-      } catch (error) {
-        ackFail(ack, error);
-      }
-    });
-
-    socket.on('file:end', (payload, ack) => {
-      try {
-        const delivered = routeToTargets('file:end', payload.targets, payload);
-        log('success', `File transfer completed: ${payload.name}`);
-        ackOk(ack, { delivered });
-      } catch (error) {
-        ackFail(ack, error);
-      }
-    });
-
-    socket.on('file:progress:report', (payload) => {
-      if (payload.senderId === device.id) {
-        sendToRenderer('file:progress', payload);
-      } else {
-        ioServer.to(payload.senderId).emit('file:progress:report', payload);
-      }
-    });
-
-    socket.on('webrtc:signal', (payload, ack) => {
-      try {
-        if (payload.to === device.id) {
-          sendToRenderer('webrtc:signal', payload);
-        } else {
-          ioServer.to(payload.to).emit('webrtc:signal', payload);
-        }
-        ackOk(ack);
-      } catch (error) {
-        ackFail(ack, error);
-      }
-    });
-
-    socket.on('call:event', (payload, ack) => {
-      try {
-        const delivered = routeToTargets('call:event', payload.targets, payload);
-        ackOk(ack, { delivered });
-      } catch (error) {
-        ackFail(ack, error);
-      }
-    });
-
-    socket.on('ping:client', (payload, ack) => {
-      if (ack) ack({ time: payload.time });
-    });
-
-    socket.on('disconnect', () => {
-      if (registeredId && devices.has(registeredId)) {
-        if (registeredId === device.id) return;
-        const offline = { ...devices.get(registeredId), status: 'offline', rtt: 0 };
-        devices.set(registeredId, offline);
-        emitDevices();
-        if (registeredId !== device.id) log('warning', `Client disconnected: ${offline.name}`);
-      }
-    });
-    });
-
-    httpServer.listen(APP_PORT, '0.0.0.0', () => {
-      log('success', 'Ready for manual peer connection');
-      sendToRenderer('lan:status', { role, localIp: device.ip, connected: false, host: hostInfo });
-      connectToHost({ ip: '127.0.0.1', port: APP_PORT, id: device.id, name: device.name });
-      resolve();
-    });
-
-    httpServer.on('error', (error) => {
-      log('error', 'Local server failed to start', { error: error.message });
-      resolve();
-    });
-  });
-  return hostReadyPromise;
-}
-
-function routeToTargets(event, targets, payload) {
-  const onlineTargets = (targets || []).filter((id) => devices.get(id)?.status === 'online');
-  let delivered = 0;
-  for (const target of onlineTargets) {
-    if (target === device.id) {
-      deliverLocalEvent(event, payload);
-      delivered += 1;
-      continue;
-    }
-    ioServer.to(target).emit(event, payload);
-    delivered += 1;
-  }
-  return delivered;
-}
-
-function deliverLocalEvent(event, payload) {
-  if (event === 'message:received') {
-    log('success', 'Message received');
-    sendToRenderer('chat:message', payload);
-    return;
-  }
-  if (event === 'file:start') {
-    handleIncomingFileStart(payload);
-    return;
-  }
-  if (event === 'file:chunk') {
-    handleIncomingFileChunk(payload);
-    return;
-  }
-  if (event === 'file:end') {
-    handleIncomingFileEnd(payload);
-    return;
-  }
-  if (event === 'call:event') {
-    sendToRenderer('call:event', payload);
-  }
-}
-
-function connectToHost(host) {
-  if (socketClient) {
-    socketClient.removeAllListeners();
-    socketClient.close();
-    socketClient = null;
-  }
-  role = host.id === device.id ? 'Host' : 'Client';
-  device.role = role;
-  device.ip = getLanIp();
-  upsertDevice(device);
-
-  const url = `http://${host.ip}:${host.port}`;
-  socketClient = Client(url, {
-    reconnection: true,
-    reconnectionAttempts: Infinity,
-    reconnectionDelay: 1000,
-    reconnectionDelayMax: 3000,
-    timeout: 5000
-  });
-
-  socketClient.on('connect', () => {
-    log('success', host.id === device.id ? 'Local server bridge ready' : `Connected to peer ${host.name}`);
-    socketClient.emit('device:hello', device);
-    sendToRenderer('lan:status', { role, localIp: device.ip, connected: true, host });
-    if (host.id !== device.id) startPingLoop();
-  });
-
-  socketClient.on('disconnect', () => {
-    log('warning', 'Disconnected from host');
-    sendToRenderer('lan:status', { role, localIp: device.ip, connected: false, host });
-  });
-
-  socketClient.on('reconnect_failed', () => {
-    handleHostLost();
-  });
-
-  socketClient.on('connect_error', (error) => log('error', 'Host connection error', { error: error.message }));
-  socketClient.on('devices:update', (list) => {
-    let changed = false;
-    for (const item of list) {
-      if (item.id === device.id) continue;
-      const current = devices.get(item.id) || {};
-      devices.set(item.id, {
-        ...current,
-        ...item,
-        lastSeen: Date.now()
-      });
-      changed = true;
-    }
-    if (changed) emitDevices();
-  });
-  socketClient.on('message:received', (payload) => {
-    log('success', 'Message received');
-    sendToRenderer('chat:message', payload);
-  });
-  socketClient.on('file:start', handleIncomingFileStart);
-  socketClient.on('file:chunk', handleIncomingFileChunk);
-  socketClient.on('file:end', handleIncomingFileEnd);
-  socketClient.on('file:progress:report', (payload) => sendToRenderer('file:progress', payload));
-  socketClient.on('webrtc:signal', (payload) => sendToRenderer('webrtc:signal', payload));
-  socketClient.on('call:event', (payload) => sendToRenderer('call:event', payload));
-}
-
-function handleHostLost() {
-  log('warning', 'Peer connection lost. Enter the peer IP and connect again if needed.');
-  device.rtt = 0;
-  for (const item of devices.values()) {
-    if (item.id !== device.id) {
-      item.status = 'offline';
-      item.rtt = 0;
-    }
-  }
-  emitDevices();
-  sendToRenderer('lan:status', { role: 'Host', localIp: device.ip, connected: false, host: hostInfo });
-}
-
-function startPingLoop() {
-  clearInterval(pingTimer);
-  clearInterval(offlineTimer);
-
-  pingTimer = setInterval(() => {
-    if (!socketClient?.connected) return;
-    const started = Date.now();
-    socketClient.timeout(2000).emit('ping:client', { from: device.id, time: started }, (error) => {
-      if (error) return;
-      const nextRtt = Date.now() - started;
-      const smoothed = device.rtt ? (device.rtt * 0.7) + (nextRtt * 0.3) : nextRtt;
-      device.rtt = Math.max(1, Math.round(smoothed / 5) * 5);
-      device.lastSeen = Date.now();
-      upsertDevice(device);
-      socketClient.emit('device:hello', device);
-      if (Date.now() - lastPingLogAt > 10000) {
-        lastPingLogAt = Date.now();
-        log('info', 'Ping RTT updated', { rtt: device.rtt });
-      }
-    });
-  }, PING_INTERVAL_MS);
-
-  offlineTimer = setInterval(() => {
-    if (!ioServer) return;
-    let changed = false;
-    for (const item of devices.values()) {
-      if (item.id === device.id) continue;
-      if (item.status === 'online' && Date.now() - item.lastSeen > OFFLINE_TIMEOUT_MS) {
-        item.status = 'offline';
-        item.rtt = 0;
-        changed = true;
-        log('warning', `Device offline: ${item.name}`);
-      }
-    }
-    if (changed) emitDevices();
-  }, 1500);
-}
-
-function handleIncomingFileStart(payload) {
-  const dir = path.join(app.getPath('downloads'), 'LANLinkReceived');
-  fs.mkdirSync(dir, { recursive: true });
-  const safeName = payload.name.replace(/[\\/:*?"<>|]/g, '_');
-  const filePath = path.join(dir, `${Date.now()}-${safeName}`);
-  pendingFiles.set(payload.transferId, {
-    ...payload,
-    filePath,
-    stream: fs.createWriteStream(filePath),
-    received: 0,
-    startedAt: Date.now(),
-    lastReportedAt: 0
-  });
-  log('info', `Receiving file: ${payload.name}`);
-  
-  const progressInfo = {
-    transferId: payload.transferId,
-    receiverId: device.id,
-    senderId: payload.sender.id,
-    name: payload.name,
-    size: payload.size,
-    progress: 0,
-    speedMbps: 0,
-    avgSpeedMbps: 0,
-    status: 'receiving'
-  };
-  sendToRenderer('file:progress', progressInfo);
-  socketClient?.emit('file:progress:report', progressInfo);
-}
-
-function handleIncomingFileChunk(payload) {
-  const transfer = pendingFiles.get(payload.transferId);
-  if (!transfer) return;
-  const chunk = Buffer.from(payload.chunk);
-  transfer.stream.write(chunk);
-  transfer.received += chunk.length;
-
-  if (!transfer.inProgressLogged) {
-    transfer.inProgressLogged = true;
-    log('info', `File transfer in progress: ${transfer.name}`);
-  }
-  
-  const now = Date.now();
-  const elapsed = Math.max(1, now - transfer.startedAt) / 1000;
-  const speedMbps = (transfer.received * 8) / elapsed / 1000000;
-  const avgSpeedMbps = speedMbps;
-  const progress = Math.min(100, (transfer.received / transfer.size) * 100);
-  
-  const isFinished = transfer.received >= transfer.size;
-  const isFirst = transfer.received === chunk.length;
-  
-  if (isFirst || isFinished || now - transfer.lastReportedAt >= 150) {
-    transfer.lastReportedAt = now;
-    
-    const progressInfo = {
-      transferId: transfer.transferId,
-      receiverId: device.id,
-      senderId: transfer.sender.id,
-      name: transfer.name,
-      size: transfer.size,
-      progress,
-      speedMbps,
-      avgSpeedMbps,
-      status: 'receiving'
-    };
-    sendToRenderer('file:progress', progressInfo);
-    socketClient?.emit('file:progress:report', progressInfo);
-  }
-}
-
-function handleIncomingFileEnd(payload) {
-  const transfer = pendingFiles.get(payload.transferId);
-  if (!transfer) return;
-  transfer.stream.end();
-  pendingFiles.delete(payload.transferId);
-  log('success', `File saved: ${transfer.filePath}`);
-  
-  const progressInfo = {
-    transferId: transfer.transferId,
-    receiverId: device.id,
-    senderId: transfer.sender.id,
-    name: transfer.name,
-    size: transfer.size,
-    progress: 100,
-    speedMbps: 0,
-    avgSpeedMbps: 0,
-    status: 'completed',
-    filePath: transfer.filePath
-  };
-  sendToRenderer('file:progress', progressInfo);
-  socketClient?.emit('file:progress:report', progressInfo);
-}
-
-ipcMain.handle('app:get-info', () => ({
-  id: device.id,
-  name: device.name,
-  ip: getLanIp(),
-  role,
-  port: APP_PORT
-}));
-
-ipcMain.handle('app:get-interfaces', () => getNetworkInterfaces());
-
-ipcMain.handle('app:set-active-ip', (_event, ip) => {
-  userSelectedIp = ip;
-  device.ip = getLanIp();
-  upsertDevice(device);
-  if (socketClient?.connected) {
-    socketClient.emit('device:hello', device);
-  }
-  log('info', `Active IP changed to: ${device.ip}`);
-  return device.ip;
-});
-
-ipcMain.handle('dialog:pick-file', async () => {
-  const result = await dialog.showOpenDialog(mainWindow, { properties: ['openFile'] });
-  if (result.canceled || !result.filePaths[0]) return null;
-  const filePath = result.filePaths[0];
-  const stat = fs.statSync(filePath);
-  return { path: filePath, name: path.basename(filePath), size: stat.size };
-});
-
-ipcMain.handle('chat:send', async (_event, payload) => {
-  const result = await emitWithAck('message:send', { ...payload, sender: device });
-  if (result?.ok === false) throw new Error(result.error || 'Message send failed');
-  if ((result?.delivered || 0) < (payload.targets || []).length) {
-    throw new Error(`Message delivered to ${result?.delivered || 0}/${(payload.targets || []).length} target(s)`);
-  }
-  return result;
-});
-
-ipcMain.handle('file:send', async (_event, payload) => {
-  if (!socketClient?.connected) throw new Error('Not connected to a host');
-  const transferId = payload.transferId || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const stat = fs.statSync(payload.path);
-  const info = {
-    transferId,
-    name: path.basename(payload.path),
-    size: stat.size,
-    sender: device,
-    targets: payload.targets,
-    startedAt: Date.now()
-  };
-  const startResult = await emitWithAck('file:start', info);
-  if (startResult?.ok === false) throw new Error(startResult.error || 'File transfer failed to start');
-  if ((startResult?.delivered || 0) < (payload.targets || []).length) {
-    throw new Error(`File transfer started on ${startResult?.delivered || 0}/${(payload.targets || []).length} target(s)`);
-  }
-  const stream = fs.createReadStream(payload.path, { highWaterMark: 32 * 1024 });
-  let sent = 0;
-  const startedAt = Date.now();
-  let lastReportedAt = 0;
-  let inProgressLogged = false;
-
-  for await (const chunk of stream) {
-    sent += chunk.length;
-    socketClient.emit('file:chunk', { ...info, chunk, sent });
-
-    if (!inProgressLogged) {
-      inProgressLogged = true;
-      log('info', `File transfer in progress: ${info.name}`);
-    }
-    
-    const now = Date.now();
-    const isFinished = sent >= stat.size;
-    const isFirst = sent === chunk.length;
-    
-    if (isFirst || isFinished || now - lastReportedAt >= 150) {
-      lastReportedAt = now;
-      const elapsed = Math.max(1, now - startedAt) / 1000;
-      const speedMbps = (sent * 8) / elapsed / 1000000;
-      const avgSpeedMbps = speedMbps;
-      sendToRenderer('file:progress', {
-        ...info,
-        receiverId: 'sender-upload',
-        received: sent,
-        progress: (sent / stat.size) * 100,
-        speedMbps,
-        avgSpeedMbps,
-        status: isFinished ? 'completed' : 'sending'
-      });
-    }
-  }
-
-  const endResult = await emitWithAck('file:end', info, 15000);
-  if (endResult?.ok === false) throw new Error(endResult.error || 'File transfer failed to finish');
-  sendToRenderer('file:progress', { ...info, receiverId: 'sender-upload', received: stat.size, progress: 100, speedMbps: 0, avgSpeedMbps: 0, status: 'completed' });
-});
-
-ipcMain.handle('webrtc:signal', async (_event, payload) => {
-  const result = await emitWithAck('webrtc:signal', { ...payload, from: device.id });
-  if (result?.ok === false) throw new Error(result.error || 'WebRTC signaling failed');
-  return result;
-});
-
-ipcMain.handle('call:event', async (_event, payload) => {
-  const result = await emitWithAck('call:event', { ...payload, from: device.id, sender: device });
-  if (result?.ok === false) throw new Error(result.error || 'Call event failed');
-  return result;
-});
-
-ipcMain.handle('lan:connect-peer', async (_event, ip) => {
-  const peerIp = String(ip || '').trim();
-  if (!isValidIpv4(peerIp)) throw new Error('Invalid peer IP address');
-  device.ip = getLanIp();
-  if (peerIp === device.ip || peerIp === '127.0.0.1') {
-    throw new Error('Peer IP must be the other computer, not this device');
-  }
-  pairedPeerIp = peerIp;
-  devices.clear();
-  devices.set(device.id, { ...device, status: 'online', lastSeen: Date.now() });
-  emitDevices();
-  await becomeHost();
-  log('info', `Connecting to peer ${peerIp}`);
-  connectToHost({ ip: peerIp, port: APP_PORT, id: null, name: peerIp });
-  sendToRenderer('lan:status', { role: 'Client', localIp: device.ip, connected: false, host: { ip: peerIp, port: APP_PORT } });
-  return { ok: true, ip: peerIp };
-});
-
-function shutdownRuntime() {
-  clearInterval(pingTimer);
-  clearInterval(offlineTimer);
-  socketClient?.close();
-  socketClient = null;
-  ioServer?.close();
-  ioServer = null;
-  httpServer?.close();
-  httpServer = null;
-}
