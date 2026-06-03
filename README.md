@@ -218,10 +218,11 @@ Run the same command on each computer in the same LAN.
 3. Wait a few seconds. If no host is found, the first app becomes Host.
 4. Run `npm start` on other computers.
 5. Clients should discover the host automatically and connect without typing an IP address.
-6. Select one or more online devices from the left sidebar.
-7. Send a text message.
-8. Pick a file and send it. Progress and Mbps should update per transfer.
-9. Select one online device and click `Start call` to test voice/video.
+6. If the list looks stale, click `Reload` in the left sidebar to restart LAN discovery.
+7. Select one or more online devices from the left sidebar.
+8. Send a text message.
+9. Pick a file and send it. Progress and Mbps should update per transfer.
+10. Select one online device and click `Start call` to test voice/video.
 
 Received files are saved to:
 
@@ -239,6 +240,7 @@ Downloads/LANLinkReceived/
   - UDP `41234` for LAN host discovery.
   - TCP `32150` for Socket.IO communication.
 - If two computers both become host, close clients, start one host first, wait 3 seconds, then start the other apps.
+- If a device does not appear after changing Wi-Fi/Ethernet, click `Reload` to restart scanning.
 - If webcam or microphone does not work, check OS privacy permissions for Electron/Terminal.
 - If WebRTC video does not connect, test text chat first. WebRTC signaling uses the Socket.IO host, so chat must work before calls can work.
 

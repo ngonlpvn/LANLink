@@ -13,6 +13,7 @@ const DISCOVERY_MAGIC = 'LANLINK_HOST_V1';
 const PING_INTERVAL_MS = 1000;
 const OFFLINE_TIMEOUT_MS = 5000;
 const DISCOVERY_WAIT_MS = 2500;
+const SOCKET_ACK_TIMEOUT_MS = 5000;
 
 let mainWindow;
 let udpSocket;
@@ -23,6 +24,7 @@ let discoveryTimer;
 let broadcastTimer;
 let pingTimer;
 let offlineTimer;
+let lastPingLogAt = 0;
 let role = 'Scanning';
 let hostInfo = null;
 let userSelectedIp = null;
@@ -57,7 +59,13 @@ function getNetworkInterfaces() {
         } else if (/eth|ether|lan|en[1-9]/i.test(name)) {
           type = 'LAN';
         }
-        list.push({ name, address: entry.address, type });
+        list.push({
+          name,
+          address: entry.address,
+          netmask: entry.netmask,
+          broadcast: getBroadcastAddress(entry.address, entry.netmask),
+          type
+        });
       }
     }
   }
@@ -67,6 +75,19 @@ function getNetworkInterfaces() {
     if (a.type !== b.type) return a.type === 'LAN' ? -1 : 1;
     return a.name.localeCompare(b.name);
   });
+}
+
+function ipToInt(ip) {
+  return ip.split('.').reduce((sum, part) => ((sum << 8) + Number(part)) >>> 0, 0);
+}
+
+function intToIp(value) {
+  return [24, 16, 8, 0].map((shift) => (value >>> shift) & 255).join('.');
+}
+
+function getBroadcastAddress(address, netmask) {
+  if (!address || !netmask) return '255.255.255.255';
+  return intToIp((ipToInt(address) | (~ipToInt(netmask))) >>> 0);
 }
 
 function getLanIp() {
@@ -88,6 +109,21 @@ function sendToRenderer(channel, payload) {
 
 function log(type, message, meta = {}) {
   sendToRenderer('lan:log', { time: Date.now(), type, message, meta });
+}
+
+function ackOk(ack, payload = {}) {
+  if (typeof ack === 'function') ack({ ok: true, ...payload });
+}
+
+function ackFail(ack, error) {
+  if (typeof ack === 'function') ack({ ok: false, error: error?.message || String(error) });
+}
+
+function emitWithAck(event, payload, timeout = SOCKET_ACK_TIMEOUT_MS) {
+  if (!socketClient?.connected) {
+    return Promise.reject(new Error('Not connected to a host'));
+  }
+  return socketClient.timeout(timeout).emitWithAck(event, payload);
 }
 
 function publicDevices() {
@@ -156,6 +192,9 @@ app.on('activate', () => {
 });
 
 function startLanRuntime() {
+  device.ip = getLanIp();
+  device.status = 'online';
+  device.lastSeen = Date.now();
   devices.set(device.id, device);
   setupUdpDiscovery();
   log('info', 'LAN scanning started');
@@ -238,32 +277,55 @@ function becomeHost() {
     let registeredId = null;
 
     socket.on('device:hello', (hello) => {
+      const current = devices.get(hello.id);
+      const shouldLogConnection = hello.id !== device.id && (!current || current.status !== 'online');
       registeredId = hello.id;
       upsertDevice({ ...hello, role: hello.id === device.id ? 'Host' : 'Client', status: 'online' });
       socket.join(hello.id);
       socket.emit('devices:update', publicDevices());
       socket.broadcast.emit('devices:update', publicDevices());
-      if (hello.id !== device.id) log('success', `Client connected: ${hello.name}`);
+      if (shouldLogConnection) log('success', `Client connected: ${hello.name}`);
     });
 
-    socket.on('message:send', (payload) => {
-      const message = { ...payload, id: `${Date.now()}-${Math.random()}`, time: Date.now() };
-      routeToTargets('message:received', message.targets, message);
-      log('info', 'Message sent', { targets: message.targets });
+    socket.on('message:send', (payload, ack) => {
+      try {
+        const message = { ...payload, id: `${Date.now()}-${Math.random()}`, time: Date.now() };
+        const delivered = routeToTargets('message:received', message.targets, message);
+        log('info', 'Message sent', { targets: message.targets, delivered });
+        ackOk(ack, { delivered });
+      } catch (error) {
+        log('error', 'Message send failed', { error: error.message });
+        ackFail(ack, error);
+      }
     });
 
-    socket.on('file:start', (payload) => {
-      routeToTargets('file:start', payload.targets, payload);
-      log('info', `File transfer started: ${payload.name}`);
+    socket.on('file:start', (payload, ack) => {
+      try {
+        const delivered = routeToTargets('file:start', payload.targets, payload);
+        log('info', `File transfer started: ${payload.name}`);
+        ackOk(ack, { delivered });
+      } catch (error) {
+        ackFail(ack, error);
+      }
     });
 
-    socket.on('file:chunk', (payload) => {
-      routeToTargets('file:chunk', payload.targets, payload);
+    socket.on('file:chunk', (payload, ack) => {
+      try {
+        const delivered = routeToTargets('file:chunk', payload.targets, payload);
+        ackOk(ack, { delivered });
+      } catch (error) {
+        ackFail(ack, error);
+      }
     });
 
-    socket.on('file:end', (payload) => {
-      routeToTargets('file:end', payload.targets, payload);
-      log('success', `File transfer completed: ${payload.name}`);
+    socket.on('file:end', (payload, ack) => {
+      try {
+        const delivered = routeToTargets('file:end', payload.targets, payload);
+        log('success', `File transfer completed: ${payload.name}`);
+        ackOk(ack, { delivered });
+      } catch (error) {
+        ackFail(ack, error);
+      }
     });
 
     socket.on('file:progress:report', (payload) => {
@@ -274,12 +336,22 @@ function becomeHost() {
       }
     });
 
-    socket.on('webrtc:signal', (payload) => {
-      ioServer.to(payload.to).emit('webrtc:signal', payload);
+    socket.on('webrtc:signal', (payload, ack) => {
+      try {
+        ioServer.to(payload.to).emit('webrtc:signal', payload);
+        ackOk(ack);
+      } catch (error) {
+        ackFail(ack, error);
+      }
     });
 
-    socket.on('call:event', (payload) => {
-      routeToTargets('call:event', payload.targets, payload);
+    socket.on('call:event', (payload, ack) => {
+      try {
+        const delivered = routeToTargets('call:event', payload.targets, payload);
+        ackOk(ack, { delivered });
+      } catch (error) {
+        ackFail(ack, error);
+      }
     });
 
     socket.on('ping:client', (payload, ack) => {
@@ -310,20 +382,28 @@ function becomeHost() {
 function routeToTargets(event, targets, payload) {
   const onlineTargets = (targets || []).filter((id) => devices.get(id)?.status === 'online');
   for (const target of onlineTargets) ioServer.to(target).emit(event, payload);
+  return onlineTargets.length;
 }
 
 function startHostBroadcast() {
   clearInterval(broadcastTimer);
-  const packet = Buffer.from(JSON.stringify({
-    magic: DISCOVERY_MAGIC,
-    deviceId: device.id,
-    name: device.name,
-    ip: device.ip,
-    port: APP_PORT,
-    time: Date.now()
-  }));
   broadcastTimer = setInterval(() => {
-    if (udpSocket) udpSocket.send(packet, 0, packet.length, DISCOVERY_PORT, '255.255.255.255');
+    if (!udpSocket) return;
+    const packet = Buffer.from(JSON.stringify({
+      magic: DISCOVERY_MAGIC,
+      deviceId: device.id,
+      name: device.name,
+      ip: device.ip,
+      port: APP_PORT,
+      time: Date.now()
+    }));
+    const targets = new Set(['255.255.255.255']);
+    for (const item of getNetworkInterfaces()) {
+      if (item.broadcast) targets.add(item.broadcast);
+    }
+    for (const target of targets) {
+      udpSocket.send(packet, 0, packet.length, DISCOVERY_PORT, target);
+    }
   }, 1000);
 }
 
@@ -396,7 +476,10 @@ function startPingLoop() {
       device.lastSeen = Date.now();
       upsertDevice(device);
       socketClient.emit('device:hello', device);
-      log('info', 'Ping RTT updated', { rtt: device.rtt });
+      if (Date.now() - lastPingLogAt > 10000) {
+        lastPingLogAt = Date.now();
+        log('info', 'Ping RTT updated', { rtt: device.rtt });
+      }
     });
   }, PING_INTERVAL_MS);
 
@@ -538,8 +621,10 @@ ipcMain.handle('dialog:pick-file', async () => {
   return { path: filePath, name: path.basename(filePath), size: stat.size };
 });
 
-ipcMain.handle('chat:send', (_event, payload) => {
-  socketClient?.emit('message:send', { ...payload, sender: device });
+ipcMain.handle('chat:send', async (_event, payload) => {
+  const result = await emitWithAck('message:send', { ...payload, sender: device });
+  if (result?.ok === false) throw new Error(result.error || 'Message send failed');
+  return result;
 });
 
 ipcMain.handle('file:send', async (_event, payload) => {
@@ -554,8 +639,9 @@ ipcMain.handle('file:send', async (_event, payload) => {
     targets: payload.targets,
     startedAt: Date.now()
   };
-  socketClient.emit('file:start', info);
-  const stream = fs.createReadStream(payload.path, { highWaterMark: 64 * 1024 });
+  const startResult = await emitWithAck('file:start', info);
+  if (startResult?.ok === false) throw new Error(startResult.error || 'File transfer failed to start');
+  const stream = fs.createReadStream(payload.path, { highWaterMark: 32 * 1024 });
   let sent = 0;
   const startedAt = Date.now();
   let lastReportedAt = 0;
@@ -563,7 +649,8 @@ ipcMain.handle('file:send', async (_event, payload) => {
 
   for await (const chunk of stream) {
     sent += chunk.length;
-    socketClient.emit('file:chunk', { ...info, chunk, sent });
+    const chunkResult = await emitWithAck('file:chunk', { ...info, chunk, sent }, 8000);
+    if (chunkResult?.ok === false) throw new Error(chunkResult.error || 'File chunk failed');
 
     if (!inProgressLogged) {
       inProgressLogged = true;
@@ -591,16 +678,39 @@ ipcMain.handle('file:send', async (_event, payload) => {
     }
   }
 
-  socketClient.emit('file:end', info);
+  const endResult = await emitWithAck('file:end', info);
+  if (endResult?.ok === false) throw new Error(endResult.error || 'File transfer failed to finish');
   sendToRenderer('file:progress', { ...info, receiverId: 'sender-upload', received: stat.size, progress: 100, speedMbps: 0, avgSpeedMbps: 0, status: 'completed' });
 });
 
-ipcMain.handle('webrtc:signal', (_event, payload) => {
-  socketClient?.emit('webrtc:signal', { ...payload, from: device.id });
+ipcMain.handle('webrtc:signal', async (_event, payload) => {
+  const result = await emitWithAck('webrtc:signal', { ...payload, from: device.id });
+  if (result?.ok === false) throw new Error(result.error || 'WebRTC signaling failed');
+  return result;
 });
 
-ipcMain.handle('call:event', (_event, payload) => {
-  socketClient?.emit('call:event', { ...payload, from: device.id, sender: device });
+ipcMain.handle('call:event', async (_event, payload) => {
+  const result = await emitWithAck('call:event', { ...payload, from: device.id, sender: device });
+  if (result?.ok === false) throw new Error(result.error || 'Call event failed');
+  return result;
+});
+
+ipcMain.handle('lan:rescan', async () => {
+  log('info', 'Manual LAN rescan started');
+  shutdownRuntime();
+  hostInfo = null;
+  role = 'Scanning';
+  device.role = 'Scanning';
+  device.status = 'online';
+  device.rtt = 0;
+  device.ip = getLanIp();
+  device.lastSeen = Date.now();
+  devices.clear();
+  devices.set(device.id, device);
+  emitDevices();
+  sendToRenderer('lan:status', { role, localIp: device.ip, connected: false, host: null });
+  startLanRuntime();
+  return { ok: true };
 });
 
 function shutdownRuntime() {

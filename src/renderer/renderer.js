@@ -12,7 +12,8 @@ const state = {
   micEnabled: true,
   camEnabled: true,
   chart: null,
-  iceCandidatesQueue: []
+  iceCandidatesQueue: [],
+  displayedAvgPing: 0
 };
 
 const els = {
@@ -34,6 +35,7 @@ const els = {
   fileSize: document.querySelector('#fileSize'),
   transferList: document.querySelector('#transferList'),
   eventLog: document.querySelector('#eventLog'),
+  rescanBtn: document.querySelector('#rescanBtn'),
   selectAllBtn: document.querySelector('#selectAllBtn'),
   clearTargetsBtn: document.querySelector('#clearTargetsBtn'),
   clearLogBtn: document.querySelector('#clearLogBtn'),
@@ -77,7 +79,9 @@ function bindEvents() {
     for (const id of [...state.selectedTargets]) {
       if (!devices.find((device) => device.id === id && device.status === 'online')) state.selectedTargets.delete(id);
     }
-    renderAll();
+    renderStatus();
+    renderDevices();
+    renderTargets();
   });
 
   window.lanlink.onLog(addLog);
@@ -106,6 +110,23 @@ function bindEvents() {
     renderAll();
   });
 
+  els.rescanBtn.addEventListener('click', async () => {
+    els.rescanBtn.disabled = true;
+    addLog({ type: 'info', message: 'Reloading LAN scan...', time: Date.now() });
+    try {
+      state.selectedTargets.clear();
+      state.transfers.clear();
+      await window.lanlink.rescan();
+      renderAll();
+    } catch (error) {
+      addLog({ type: 'error', message: `Reload scan failed: ${error.message}`, time: Date.now() });
+    } finally {
+      setTimeout(() => {
+        els.rescanBtn.disabled = false;
+      }, 1200);
+    }
+  });
+
   els.clearLogBtn.addEventListener('click', () => {
     els.eventLog.innerHTML = '';
   });
@@ -125,8 +146,12 @@ function bindEvents() {
     state.messages.push(message);
     renderMessages();
     els.messageInput.value = '';
-    await window.lanlink.sendMessage(message);
-    addLog({ type: 'success', message: 'Message sent', time: Date.now() });
+    try {
+      await window.lanlink.sendMessage(message);
+      addLog({ type: 'success', message: 'Message sent', time: Date.now() });
+    } catch (error) {
+      addLog({ type: 'error', message: `Message send failed: ${error.message}`, time: Date.now() });
+    }
   });
 
   els.pickFileBtn.addEventListener('click', async () => {
@@ -204,12 +229,19 @@ function renderAll() {
 function renderStatus() {
   const online = state.devices.filter((device) => device.status === 'online');
   const avgPing = average(online.filter((device) => device.rtt > 0).map((device) => device.rtt));
+  if (avgPing > 0) {
+    state.displayedAvgPing = state.displayedAvgPing
+      ? (state.displayedAvgPing * 0.72) + (avgPing * 0.28)
+      : avgPing;
+  } else if (!online.length) {
+    state.displayedAvgPing = 0;
+  }
   els.roleValue.textContent = state.status.role || state.me?.role || 'Scanning';
   if (els.ipSelector) els.ipSelector.value = state.status.localIp || state.me?.ip || '';
   els.connectionValue.textContent = state.status.connected ? 'Connected' : 'Scanning LAN';
   els.connectionValue.className = `status-text ${state.status.connected ? 'success' : 'warning'}`;
   els.onlineValue.textContent = online.length;
-  els.pingValue.textContent = `${Math.round(avgPing)} ms`;
+  els.pingValue.textContent = `${Math.round(state.displayedAvgPing)} ms`;
   els.deviceCountLabel.textContent = `${online.length} online`;
 }
 
@@ -261,9 +293,10 @@ function renderDevices() {
       `;
       
       card.addEventListener('click', () => {
-        if (device.id === state.me?.id || device.status !== 'online') return;
-        if (state.selectedTargets.has(device.id)) state.selectedTargets.delete(device.id);
-        else state.selectedTargets.add(device.id);
+        const latest = state.devices.find((item) => item.id === card.dataset.id);
+        if (!latest || latest.id === state.me?.id || latest.status !== 'online') return;
+        if (state.selectedTargets.has(latest.id)) state.selectedTargets.delete(latest.id);
+        else state.selectedTargets.add(latest.id);
         renderAll();
       });
       
@@ -482,8 +515,11 @@ async function handleSignal(payload) {
 }
 
 function createPeer(target) {
-  closePeer();
-  state.peer = new RTCPeerConnection({ iceServers: [] });
+  closePeer({ stopMedia: false });
+  state.peer = new RTCPeerConnection({
+    iceServers: [],
+    iceCandidatePoolSize: 4
+  });
   if (state.localStream) {
     for (const track of state.localStream.getTracks()) state.peer.addTrack(track, state.localStream);
   }
@@ -494,14 +530,19 @@ function createPeer(target) {
     els.remoteVideo.srcObject = event.streams[0];
   };
   state.peer.onconnectionstatechange = () => {
-    if (['failed', 'closed', 'disconnected'].includes(state.peer.connectionState)) endCall();
+    const connectionState = state.peer?.connectionState;
+    if (connectionState === 'connected') {
+      setCallStatus(`In call with ${deviceName(state.activeCallTarget)}`, true);
+      addLog({ type: 'success', message: 'WebRTC peer connected', time: Date.now() });
+    }
+    if (['failed', 'closed', 'disconnected'].includes(connectionState)) endCall();
   };
 }
 
 async function ensureMedia() {
   if (state.localStream) return;
   try {
-    state.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+    state.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: state.camEnabled });
   } catch (err) {
     console.warn("Failed to get audio and video, trying audio only:", err);
     try {
@@ -562,7 +603,8 @@ async function endCall() {
   addLog({ type: 'warning', message: `${isVideo ? 'Video' : 'Voice'} call ended`, time: Date.now() });
 }
 
-function closePeer() {
+function closePeer(options = {}) {
+  const { stopMedia = true } = options;
   if (state.peer) {
     try {
       state.peer.close();
@@ -573,7 +615,7 @@ function closePeer() {
   els.remoteVideo.srcObject = null;
   state.iceCandidatesQueue = [];
   
-  if (state.localStream) {
+  if (stopMedia && state.localStream) {
     for (const track of state.localStream.getTracks()) {
       try {
         track.stop();
