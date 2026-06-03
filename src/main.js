@@ -159,7 +159,7 @@ function startHttpServer() {
   return new Promise((resolve) => {
     const tryBind = (port) => {
       httpServer = http.createServer((req, res) => {
-        const parsedUrl = url.parse(req.url, true);
+        const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
         const pathname = parsedUrl.pathname;
         const method = req.method;
 
@@ -296,7 +296,9 @@ function startHttpServer() {
         }
         // POST /api/localsend/v2/upload
         else if (pathname === '/api/localsend/v2/upload' && method === 'POST') {
-          const { sessionId, fileId, token } = parsedUrl.query;
+          const sessionId = parsedUrl.searchParams.get('sessionId');
+          const fileId = parsedUrl.searchParams.get('fileId');
+          const token = parsedUrl.searchParams.get('token');
           const session = activeIncomingSession;
 
           if (!session || session.sessionId !== sessionId) {
@@ -431,7 +433,7 @@ function startHttpServer() {
         }
         // POST /api/localsend/v2/cancel
         else if (pathname === '/api/localsend/v2/cancel' && method === 'POST') {
-          const { sessionId } = parsedUrl.query;
+          const sessionId = parsedUrl.searchParams.get('sessionId');
           const session = activeIncomingSession;
 
           if (session && session.sessionId === sessionId) {
