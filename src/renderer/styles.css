@@ -468,6 +468,34 @@ p, .muted {
   box-shadow: 0 0 8px var(--accent-cyan);
 }
 
+.peer-status-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  font-size: 8px;
+  font-weight: 800;
+  text-transform: uppercase;
+  color: var(--status-green);
+  background: var(--status-green-faint);
+  border: 1px solid rgba(53, 208, 127, 0.2);
+  padding: 2px 6px;
+  border-radius: 4px;
+  letter-spacing: 0.5px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  pointer-events: none;
+}
+
+.peer-status-badge .badge-dot {
+  width: 4px;
+  height: 4px;
+  background: var(--status-green);
+  border-radius: 50%;
+  display: inline-block;
+  box-shadow: 0 0 4px var(--status-green);
+}
+
 .peer-avatar {
   width: 50px;
   height: 50px;

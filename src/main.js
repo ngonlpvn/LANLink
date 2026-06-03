@@ -360,6 +360,7 @@ function startHttpServer() {
           file.filePath = filePath;
 
           let received = 0;
+          let lastReportedBytes = 0;
           const startedAt = Date.now();
           let lastReportedAt = Date.now();
 
@@ -370,9 +371,13 @@ function startHttpServer() {
 
             const now = Date.now();
             if (now - lastReportedAt >= 150) {
+              const timeDiffSec = (now - lastReportedAt) / 1000 || 0.001;
+              const bytesDiff = received - lastReportedBytes;
+              const speedMbps = (bytesDiff * 8) / timeDiffSec / 1000000;
+
               lastReportedAt = now;
-              const elapsed = (now - startedAt) / 1000 || 0.001;
-              const speedMbps = (received * 8) / elapsed / 1000000;
+              lastReportedBytes = received;
+
               sendToRenderer('file:progress', {
                 transferId: sessionId,
                 receiverId: device.id,
@@ -381,7 +386,7 @@ function startHttpServer() {
                 size: file.size,
                 progress: (received / file.size) * 100,
                 speedMbps,
-                avgSpeedMbps: speedMbps,
+                avgSpeedMbps: (received * 8) / ((now - startedAt) / 1000 || 0.001) / 1000000,
                 status: 'receiving'
               });
             }
@@ -428,6 +433,11 @@ function startHttpServer() {
             writeStream.end();
             file.status = 'failed';
             log('error', `Error receiving file ${file.fileName}: ${err.message}`);
+            sendToRenderer('file:progress', {
+              transferId: sessionId,
+              status: 'failed',
+              speedMbps: 0
+            });
             res.writeHead(500);
             res.end('Internal Server Error');
           });
@@ -926,6 +936,11 @@ ipcMain.handle('file:send', async (_event, payload) => {
           });
           resolve({ ok: true });
         } else {
+          sendToRenderer('file:progress', {
+            transferId: sessionId,
+            status: 'failed',
+            speedMbps: 0
+          });
           reject(new Error(`Upload failed with code ${res.statusCode}`));
         }
       });
@@ -933,10 +948,16 @@ ipcMain.handle('file:send', async (_event, payload) => {
 
     req.on('error', (err) => {
       fileStream.destroy();
+      sendToRenderer('file:progress', {
+        transferId: sessionId,
+        status: 'failed',
+        speedMbps: 0
+      });
       reject(err);
     });
 
     let uploadedBytes = 0;
+    let lastReportedBytes = 0;
     const startedAt = Date.now();
     let lastReportedAt = Date.now();
 
@@ -945,9 +966,13 @@ ipcMain.handle('file:send', async (_event, payload) => {
       
       const now = Date.now();
       if (now - lastReportedAt >= 150) {
+        const timeDiffSec = (now - lastReportedAt) / 1000 || 0.001;
+        const bytesDiff = uploadedBytes - lastReportedBytes;
+        const speedMbps = (bytesDiff * 8) / timeDiffSec / 1000000;
+
         lastReportedAt = now;
-        const elapsed = (now - startedAt) / 1000 || 0.001;
-        const speedMbps = (uploadedBytes * 8) / elapsed / 1000000;
+        lastReportedBytes = uploadedBytes;
+
         sendToRenderer('file:progress', {
           transferId: sessionId,
           receiverId: targetId,
@@ -956,7 +981,7 @@ ipcMain.handle('file:send', async (_event, payload) => {
           size: stat.size,
           progress: (uploadedBytes / stat.size) * 100,
           speedMbps,
-          avgSpeedMbps: speedMbps,
+          avgSpeedMbps: (uploadedBytes * 8) / ((now - startedAt) / 1000 || 0.001) / 1000000,
           status: 'sending'
         });
       }

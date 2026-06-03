@@ -281,7 +281,8 @@ function registerIpcListeners() {
 
   // Upload/Download file progress update
   window.lanlink.onFileProgress((progress) => {
-    state.activeTransfers.set(progress.transferId, progress);
+    const existing = state.activeTransfers.get(progress.transferId) || {};
+    state.activeTransfers.set(progress.transferId, { ...existing, ...progress });
     renderTransmissions();
   });
 
@@ -478,6 +479,9 @@ function renderPeersGrid() {
 
     return `
       <div class="peer-card ${isSelected ? 'selected' : ''}" onclick="selectPeer('${peer.id}')">
+        <span class="peer-status-badge">
+          <span class="badge-dot"></span>Online
+        </span>
         <div class="peer-avatar">
           ${avatarSvg}
         </div>
