@@ -420,8 +420,18 @@ function connectToHost(host) {
 
   socketClient.on('connect_error', (error) => log('error', 'Host connection error', { error: error.message }));
   socketClient.on('devices:update', (list) => {
-    for (const item of list) devices.set(item.id, item);
-    emitDevices();
+    let changed = false;
+    for (const item of list) {
+      if (item.id === device.id) continue;
+      const current = devices.get(item.id) || {};
+      devices.set(item.id, {
+        ...current,
+        ...item,
+        lastSeen: Date.now()
+      });
+      changed = true;
+    }
+    if (changed) emitDevices();
   });
   socketClient.on('message:received', (payload) => {
     log('success', 'Message received');
