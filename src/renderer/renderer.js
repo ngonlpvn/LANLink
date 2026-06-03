@@ -473,6 +473,9 @@ function renderPeersGrid() {
       avatarSvg = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>`;
     }
 
+    const rttValue = (peer.rtt !== undefined && peer.rtt > 0) ? `${peer.rtt}ms` : '—';
+    const rttClass = peer.rtt < 60 ? 'ping-good' : (peer.rtt < 160 ? 'ping-medium' : 'ping-bad');
+
     return `
       <div class="peer-card ${isSelected ? 'selected' : ''}" onclick="selectPeer('${peer.id}')">
         <div class="peer-avatar">
@@ -480,7 +483,10 @@ function renderPeersGrid() {
         </div>
         <h4 class="peer-alias" title="${escapeHtml(peer.alias)}">${escapeHtml(peer.alias)}</h4>
         <span class="peer-ip">${escapeHtml(peer.ip)}:${peer.port}</span>
-        <span class="peer-type-tag">${escapeHtml(peer.deviceModel || peer.deviceType)}</span>
+        <div class="peer-card-footer">
+          <span class="peer-type-tag">${escapeHtml(peer.deviceModel || peer.deviceType)}</span>
+          <span class="peer-ping ${rttClass}">${rttValue}</span>
+        </div>
       </div>
     `;
   }).join('');

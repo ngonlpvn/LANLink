@@ -509,6 +509,13 @@ p, .muted {
   margin-top: 2px;
 }
 
+.peer-card-footer {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+
 .peer-type-tag {
   font-size: 9px;
   font-weight: 700;
@@ -517,7 +524,32 @@ p, .muted {
   background: rgba(255, 255, 255, 0.05);
   padding: 2px 8px;
   border-radius: 99px;
-  margin-top: 10px;
+}
+
+.peer-ping {
+  font-size: 9px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 99px;
+  text-transform: uppercase;
+}
+
+.peer-ping.ping-good {
+  color: var(--status-green);
+  background: var(--status-green-faint);
+  border: 1px solid rgba(53, 208, 127, 0.15);
+}
+
+.peer-ping.ping-medium {
+  color: var(--status-amber);
+  background: var(--status-amber-faint);
+  border: 1px solid rgba(247, 185, 85, 0.15);
+}
+
+.peer-ping.ping-bad {
+  color: var(--status-red);
+  background: var(--status-red-faint);
+  border: 1px solid rgba(255, 101, 119, 0.15);
 }
 
 /* Transmitter Panel (Files & Message tabs) */

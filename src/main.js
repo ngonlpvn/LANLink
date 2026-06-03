@@ -18,6 +18,7 @@ let udpSocket;
 let scanTimer;
 let announceTimer;
 let cleanupTimer;
+let pingTimer;
 
 const device = createLocalDevice();
 const devices = new Map(); // fingerprint -> device info
@@ -650,6 +651,48 @@ function checkPeerRegistration(ip) {
   });
 }
 
+function startPingLoop() {
+  clearInterval(pingTimer);
+  pingTimer = setInterval(() => {
+    const onlinePeers = Array.from(devices.values()).filter(d => d.id !== device.id && d.status === 'online');
+    
+    onlinePeers.forEach(peer => {
+      const startTime = Date.now();
+      
+      const req = http.request({
+        hostname: peer.ip,
+        port: peer.port,
+        path: '/api/localsend/v2/info',
+        method: 'GET',
+        timeout: 1500
+      }, (res) => {
+        res.on('data', () => {}); // Consume stream so 'end' fires
+        res.on('end', () => {
+          if (res.statusCode === 200) {
+            const rtt = Date.now() - startTime;
+            const currentRtt = peer.rtt || 0;
+            const smoothed = currentRtt ? (currentRtt * 0.7) + (rtt * 0.3) : rtt;
+            peer.rtt = Math.max(1, Math.round(smoothed));
+            peer.lastSeen = Date.now(); // update active status
+            devices.set(peer.id, peer);
+            emitDevices();
+          }
+        });
+      });
+      
+      req.on('error', () => {
+        // Ignore individual ping errors; cleanupTimer handles offline states
+      });
+      
+      req.on('timeout', () => {
+        req.destroy();
+      });
+      
+      req.end();
+    });
+  }, 4000);
+}
+
 function startLanRuntime() {
   device.ip = getLanIp();
   device.status = 'online';
@@ -666,6 +709,9 @@ function startLanRuntime() {
     // Initial subnet scan
     scanSubnets();
     scanTimer = setInterval(scanSubnets, 40000); // scan subnets every 40s
+
+    // Start background ping loop
+    startPingLoop();
   });
 
   // Cleanup offline devices timer
@@ -687,6 +733,7 @@ function shutdownRuntime() {
   clearInterval(announceTimer);
   clearInterval(scanTimer);
   clearInterval(cleanupTimer);
+  clearInterval(pingTimer);
 
   if (httpServer) {
     httpServer.close();
