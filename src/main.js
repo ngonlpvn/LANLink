@@ -10,8 +10,8 @@ const { io: Client } = require('socket.io-client');
 const APP_PORT = Number(process.env.LANLINK_PORT || 32150);
 const DISCOVERY_PORT = Number(process.env.LANLINK_DISCOVERY_PORT || 41234);
 const DISCOVERY_MAGIC = 'LANLINK_HOST_V1';
-const PING_INTERVAL_MS = 1000;
-const OFFLINE_TIMEOUT_MS = 5000;
+const PING_INTERVAL_MS = 3000;
+const OFFLINE_TIMEOUT_MS = 12000;
 const DISCOVERY_WAIT_MS = 2500;
 const SOCKET_ACK_TIMEOUT_MS = 5000;
 
@@ -28,6 +28,8 @@ let lastPingLogAt = 0;
 let role = 'Scanning';
 let hostInfo = null;
 let userSelectedIp = null;
+let pairedPeerIp = null;
+let hostReadyPromise = null;
 
 const device = createLocalDevice();
 const devices = new Map();
@@ -126,8 +128,30 @@ function emitWithAck(event, payload, timeout = SOCKET_ACK_TIMEOUT_MS) {
   return socketClient.timeout(timeout).emitWithAck(event, payload);
 }
 
+function isValidIpv4(ip) {
+  const parts = String(ip || '').trim().split('.');
+  return parts.length === 4 && parts.every((part) => {
+    if (!/^\d+$/.test(part)) return false;
+    const value = Number(part);
+    return value >= 0 && value <= 255;
+  });
+}
+
 function publicDevices() {
-  return Array.from(devices.values()).sort((a, b) => {
+  const local = devices.get(device.id) || device;
+  const remotes = Array.from(devices.values())
+    .filter((item) => item.id !== device.id)
+    .filter((item) => {
+      if (pairedPeerIp) return item.ip === pairedPeerIp;
+      return item.status === 'online';
+    })
+    .sort((a, b) => {
+      if (a.status !== b.status) return a.status === 'online' ? -1 : 1;
+      return (b.lastSeen || 0) - (a.lastSeen || 0);
+    });
+  const pair = [local];
+  if (remotes[0]) pair.push(remotes[0]);
+  return pair.sort((a, b) => {
     if (a.status !== b.status) return a.status === 'online' ? -1 : 1;
     return a.name.localeCompare(b.name);
   });
@@ -217,13 +241,7 @@ function setupUdpDiscovery() {
         connectToHost(hostInfo);
       }
       if (role === 'Host' && message.deviceId < device.id) {
-        log('warning', `Another host was detected: ${message.name}. Switching to client mode.`);
-        stepDownToRemoteHost({
-          ip: rinfo.address,
-          port: message.port,
-          id: message.deviceId,
-          name: message.name
-        });
+        log('info', `Peer host detected: ${message.name} at ${rinfo.address}`);
       }
     } catch (error) {
       log('error', 'Invalid discovery packet received', { error: error.message });
@@ -260,7 +278,8 @@ function stepDownToRemoteHost(remoteHost) {
 }
 
 function becomeHost() {
-  if (role === 'Host') return;
+  if (httpServer || ioServer) return hostReadyPromise || Promise.resolve();
+  hostReadyPromise = new Promise((resolve) => {
   hostInfo = { ip: device.ip, port: APP_PORT, id: device.id, name: device.name };
   role = 'Host';
   device.role = 'Host';
@@ -338,7 +357,11 @@ function becomeHost() {
 
     socket.on('webrtc:signal', (payload, ack) => {
       try {
-        ioServer.to(payload.to).emit('webrtc:signal', payload);
+        if (payload.to === device.id) {
+          sendToRenderer('webrtc:signal', payload);
+        } else {
+          ioServer.to(payload.to).emit('webrtc:signal', payload);
+        }
         ackOk(ack);
       } catch (error) {
         ackFail(ack, error);
@@ -360,6 +383,7 @@ function becomeHost() {
 
     socket.on('disconnect', () => {
       if (registeredId && devices.has(registeredId)) {
+        if (registeredId === device.id) return;
         const offline = { ...devices.get(registeredId), status: 'offline', rtt: 0 };
         devices.set(registeredId, offline);
         emitDevices();
@@ -372,17 +396,53 @@ function becomeHost() {
     log('success', 'This device became host');
     startHostBroadcast();
     connectToHost({ ip: '127.0.0.1', port: APP_PORT, id: device.id, name: device.name });
+    resolve();
   });
 
   httpServer.on('error', (error) => {
     log('error', 'Host server failed to start', { error: error.message });
+    resolve();
   });
+  });
+  return hostReadyPromise;
 }
 
 function routeToTargets(event, targets, payload) {
   const onlineTargets = (targets || []).filter((id) => devices.get(id)?.status === 'online');
-  for (const target of onlineTargets) ioServer.to(target).emit(event, payload);
-  return onlineTargets.length;
+  let delivered = 0;
+  for (const target of onlineTargets) {
+    if (target === device.id) {
+      deliverLocalEvent(event, payload);
+      delivered += 1;
+      continue;
+    }
+    ioServer.to(target).emit(event, payload);
+    delivered += 1;
+  }
+  return delivered;
+}
+
+function deliverLocalEvent(event, payload) {
+  if (event === 'message:received') {
+    log('success', 'Message received');
+    sendToRenderer('chat:message', payload);
+    return;
+  }
+  if (event === 'file:start') {
+    handleIncomingFileStart(payload);
+    return;
+  }
+  if (event === 'file:chunk') {
+    handleIncomingFileChunk(payload);
+    return;
+  }
+  if (event === 'file:end') {
+    handleIncomingFileEnd(payload);
+    return;
+  }
+  if (event === 'call:event') {
+    sendToRenderer('call:event', payload);
+  }
 }
 
 function startHostBroadcast() {
@@ -408,13 +468,24 @@ function startHostBroadcast() {
 }
 
 function connectToHost(host) {
+  if (socketClient) {
+    socketClient.removeAllListeners();
+    socketClient.close();
+    socketClient = null;
+  }
   role = host.id === device.id ? 'Host' : 'Client';
   device.role = role;
   device.ip = getLanIp();
   upsertDevice(device);
 
   const url = `http://${host.ip}:${host.port}`;
-  socketClient = Client(url, { reconnection: true, reconnectionAttempts: 4, timeout: 3000 });
+  socketClient = Client(url, {
+    reconnection: true,
+    reconnectionAttempts: Infinity,
+    reconnectionDelay: 1000,
+    reconnectionDelayMax: 3000,
+    timeout: 5000
+  });
 
   socketClient.on('connect', () => {
     log('success', `Connected to host ${host.name}`);
@@ -470,9 +541,11 @@ function startPingLoop() {
   pingTimer = setInterval(() => {
     if (!socketClient?.connected) return;
     const started = Date.now();
-    socketClient.timeout(900).emit('ping:client', { from: device.id, time: started }, (error) => {
+    socketClient.timeout(2000).emit('ping:client', { from: device.id, time: started }, (error) => {
       if (error) return;
-      device.rtt = Date.now() - started;
+      const nextRtt = Date.now() - started;
+      const smoothed = device.rtt ? (device.rtt * 0.7) + (nextRtt * 0.3) : nextRtt;
+      device.rtt = Math.max(1, Math.round(smoothed / 5) * 5);
       device.lastSeen = Date.now();
       upsertDevice(device);
       socketClient.emit('device:hello', device);
@@ -624,6 +697,9 @@ ipcMain.handle('dialog:pick-file', async () => {
 ipcMain.handle('chat:send', async (_event, payload) => {
   const result = await emitWithAck('message:send', { ...payload, sender: device });
   if (result?.ok === false) throw new Error(result.error || 'Message send failed');
+  if ((result?.delivered || 0) < (payload.targets || []).length) {
+    throw new Error(`Message delivered to ${result?.delivered || 0}/${(payload.targets || []).length} target(s)`);
+  }
   return result;
 });
 
@@ -641,6 +717,9 @@ ipcMain.handle('file:send', async (_event, payload) => {
   };
   const startResult = await emitWithAck('file:start', info);
   if (startResult?.ok === false) throw new Error(startResult.error || 'File transfer failed to start');
+  if ((startResult?.delivered || 0) < (payload.targets || []).length) {
+    throw new Error(`File transfer started on ${startResult?.delivered || 0}/${(payload.targets || []).length} target(s)`);
+  }
   const stream = fs.createReadStream(payload.path, { highWaterMark: 32 * 1024 });
   let sent = 0;
   const startedAt = Date.now();
@@ -649,8 +728,7 @@ ipcMain.handle('file:send', async (_event, payload) => {
 
   for await (const chunk of stream) {
     sent += chunk.length;
-    const chunkResult = await emitWithAck('file:chunk', { ...info, chunk, sent }, 8000);
-    if (chunkResult?.ok === false) throw new Error(chunkResult.error || 'File chunk failed');
+    socketClient.emit('file:chunk', { ...info, chunk, sent });
 
     if (!inProgressLogged) {
       inProgressLogged = true;
@@ -678,7 +756,7 @@ ipcMain.handle('file:send', async (_event, payload) => {
     }
   }
 
-  const endResult = await emitWithAck('file:end', info);
+  const endResult = await emitWithAck('file:end', info, 15000);
   if (endResult?.ok === false) throw new Error(endResult.error || 'File transfer failed to finish');
   sendToRenderer('file:progress', { ...info, receiverId: 'sender-upload', received: stat.size, progress: 100, speedMbps: 0, avgSpeedMbps: 0, status: 'completed' });
 });
@@ -711,6 +789,24 @@ ipcMain.handle('lan:rescan', async () => {
   sendToRenderer('lan:status', { role, localIp: device.ip, connected: false, host: null });
   startLanRuntime();
   return { ok: true };
+});
+
+ipcMain.handle('lan:connect-peer', async (_event, ip) => {
+  const peerIp = String(ip || '').trim();
+  if (!isValidIpv4(peerIp)) throw new Error('Invalid peer IP address');
+  device.ip = getLanIp();
+  if (peerIp === device.ip || peerIp === '127.0.0.1') {
+    throw new Error('Peer IP must be the other computer, not this device');
+  }
+  pairedPeerIp = peerIp;
+  devices.clear();
+  devices.set(device.id, { ...device, status: 'online', lastSeen: Date.now() });
+  emitDevices();
+  await becomeHost();
+  log('info', `Connecting to peer ${peerIp}`);
+  connectToHost({ ip: peerIp, port: APP_PORT, id: null, name: peerIp });
+  sendToRenderer('lan:status', { role: 'Client', localIp: device.ip, connected: false, host: { ip: peerIp, port: APP_PORT } });
+  return { ok: true, ip: peerIp };
 });
 
 function shutdownRuntime() {

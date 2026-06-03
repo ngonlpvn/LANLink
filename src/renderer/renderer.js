@@ -36,6 +36,9 @@ const els = {
   transferList: document.querySelector('#transferList'),
   eventLog: document.querySelector('#eventLog'),
   rescanBtn: document.querySelector('#rescanBtn'),
+  peerConnectForm: document.querySelector('#peerConnectForm'),
+  peerIpInput: document.querySelector('#peerIpInput'),
+  peerConnectBtn: document.querySelector('#peerConnectBtn'),
   selectAllBtn: document.querySelector('#selectAllBtn'),
   clearTargetsBtn: document.querySelector('#clearTargetsBtn'),
   clearLogBtn: document.querySelector('#clearLogBtn'),
@@ -78,6 +81,10 @@ function bindEvents() {
     state.devices = devices;
     for (const id of [...state.selectedTargets]) {
       if (!devices.find((device) => device.id === id && device.status === 'online')) state.selectedTargets.delete(id);
+    }
+    const remotes = onlineRemoteDevices();
+    if (remotes.length === 1 && state.selectedTargets.size === 0) {
+      state.selectedTargets.add(remotes[0].id);
     }
     renderStatus();
     renderDevices();
@@ -123,6 +130,26 @@ function bindEvents() {
     } finally {
       setTimeout(() => {
         els.rescanBtn.disabled = false;
+      }, 1200);
+    }
+  });
+
+  els.peerConnectForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const ip = els.peerIpInput.value.trim();
+    if (!ip) return addLog({ type: 'warning', message: 'Enter the other computer IP first', time: Date.now() });
+    els.peerConnectBtn.disabled = true;
+    try {
+      state.selectedTargets.clear();
+      state.transfers.clear();
+      await window.lanlink.connectPeer(ip);
+      addLog({ type: 'info', message: `Connecting to peer ${ip}`, time: Date.now() });
+      renderAll();
+    } catch (error) {
+      addLog({ type: 'error', message: `Peer connect failed: ${error.message}`, time: Date.now() });
+    } finally {
+      setTimeout(() => {
+        els.peerConnectBtn.disabled = false;
       }, 1200);
     }
   });
@@ -227,7 +254,7 @@ function renderAll() {
 }
 
 function renderStatus() {
-  const online = state.devices.filter((device) => device.status === 'online');
+  const online = onlineRemoteDevices();
   const avgPing = average(online.filter((device) => device.rtt > 0).map((device) => device.rtt));
   if (avgPing > 0) {
     state.displayedAvgPing = state.displayedAvgPing
@@ -242,7 +269,7 @@ function renderStatus() {
   els.connectionValue.className = `status-text ${state.status.connected ? 'success' : 'warning'}`;
   els.onlineValue.textContent = online.length;
   els.pingValue.textContent = `${Math.round(state.displayedAvgPing)} ms`;
-  els.deviceCountLabel.textContent = `${online.length} online`;
+  els.deviceCountLabel.textContent = `${online.length} peer online`;
 }
 
 function renderDevices() {

@@ -112,6 +112,36 @@ p,
   gap: 10px;
 }
 
+.pair-form {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 16px;
+}
+
+.pair-form label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.pair-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.pair-row input {
+  min-width: 0;
+  height: 36px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  padding: 0 11px;
+  color: var(--text);
+  background: rgba(9, 17, 26, 0.78);
+  outline: none;
+}
+
 .section-label {
   display: flex;
   justify-content: space-between;

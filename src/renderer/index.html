@@ -24,8 +24,16 @@
           <button id="clearTargetsBtn" class="icon-button" type="button" title="Clear targets">X</button>
         </div>
 
+        <form id="peerConnectForm" class="pair-form">
+          <label for="peerIpInput">Peer IP</label>
+          <div class="pair-row">
+            <input id="peerIpInput" type="text" inputmode="numeric" placeholder="192.168.1.15" autocomplete="off" />
+            <button id="peerConnectBtn" class="button button-primary" type="submit">Connect</button>
+          </div>
+        </form>
+
         <div class="section-label">
-          <span>LAN Devices</span>
+          <span>Paired Devices</span>
           <span id="deviceCountLabel">0 online</span>
         </div>
         <div id="deviceList" class="device-list"></div>

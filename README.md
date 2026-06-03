@@ -211,18 +211,17 @@ npm start
 
 Run the same command on each computer in the same LAN.
 
-## Test With Multiple Computers
+## Test With Two Computers
 
-1. Connect all computers to the same Wi-Fi or Ethernet LAN.
-2. Run `npm start` on the first computer.
-3. Wait a few seconds. If no host is found, the first app becomes Host.
-4. Run `npm start` on other computers.
-5. Clients should discover the host automatically and connect without typing an IP address.
-6. If the list looks stale, click `Reload` in the left sidebar to restart LAN discovery.
-7. Select one or more online devices from the left sidebar.
-8. Send a text message.
-9. Pick a file and send it. Progress and Mbps should update per transfer.
-10. Select one online device and click `Start call` to test voice/video.
+1. Connect both computers to the same Wi-Fi or Ethernet LAN.
+2. Run `npm start` on both computers.
+3. On each app, choose the correct local LAN IP from the `Local IP` dropdown if the computer has multiple adapters.
+4. On one computer, enter the other computer's LAN IP in `Peer IP`, then click `Connect`.
+5. Wait until the peer appears online in `Paired Devices`. The app auto-selects the single online peer.
+6. Send a text message.
+7. Pick a file and send it. Progress and Mbps should update per transfer.
+8. Select the online peer and click `Start call` to test voice/video.
+9. If the connection looks stale after changing Wi-Fi/Ethernet, click `Reload`, then enter the peer IP and click `Connect` again.
 
 Received files are saved to:
 
@@ -239,15 +238,15 @@ Downloads/LANLinkReceived/
 - Confirm these ports are not blocked:
   - UDP `41234` for LAN host discovery.
   - TCP `32150` for Socket.IO communication.
-- If two computers both become host, close clients, start one host first, wait 3 seconds, then start the other apps.
-- If a device does not appear after changing Wi-Fi/Ethernet, click `Reload` to restart scanning.
+- For the most stable demo, use only two computers and connect by `Peer IP`.
+- If a device does not appear after changing Wi-Fi/Ethernet, click `Reload`, then connect to the peer IP again.
 - If webcam or microphone does not work, check OS privacy permissions for Electron/Terminal.
 - If WebRTC video does not connect, test text chat first. WebRTC signaling uses the Socket.IO host, so chat must work before calls can work.
 
 ## Notes
 
-- The host manages the device list and broadcasts updates to clients.
-- Ping RTT updates every second.
+- The app is optimized for one stable two-device pair.
+- Ping RTT updates every 3 seconds and is smoothed to avoid flickering.
 - File speed uses `Mbps = transferred bits / elapsed time / 1,000,000`.
 - WebRTC is implemented for stable 1-to-1 calls first.
 - The app prioritizes reliability and demonstration clarity over complex production networking edge cases.
