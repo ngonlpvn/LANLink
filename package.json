@@ -1,0 +1,63 @@
+{
+  "name": "lanlink",
+  "version": "1.0.0",
+  "description": "LANLink desktop app for LAN discovery, messaging, file transfer, and WebRTC calls.",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "dist": "electron-builder",
+    "dist:all": "electron-builder -mwl",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win",
+    "dist:linux": "electron-builder --linux"
+  },
+  "keywords": [
+    "electron",
+    "lan",
+    "socket.io",
+    "webrtc"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^42.3.2",
+    "electron-builder": "^25.1.8"
+  },
+  "dependencies": {
+    "chart.js": "^4.4.9",
+    "socket.io": "^4.7.5",
+    "socket.io-client": "^4.7.5"
+  },
+  "build": {
+    "appId": "com.lanlink.app",
+    "productName": "LANLink",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json",
+      "node_modules/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "zip"
+      ]
+    }
+  }
+}

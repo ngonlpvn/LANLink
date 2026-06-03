@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LANLink</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="../../node_modules/chart.js/dist/chart.umd.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar panel">
+        <div class="brand-row">
+          <div class="brand-mark">LL</div>
+          <div>
+            <h1>LANLink</h1>
+            <p>Local network console</p>
+          </div>
+        </div>
+
+        <div class="sidebar-tools">
+          <button id="selectAllBtn" class="button button-secondary" type="button">Select online</button>
+          <button id="clearTargetsBtn" class="icon-button" type="button" title="Clear targets">X</button>
+        </div>
+
+        <div class="section-label">
+          <span>LAN Devices</span>
+          <span id="deviceCountLabel">0 online</span>
+        </div>
+        <div id="deviceList" class="device-list"></div>
+      </aside>
+
+      <main class="main-grid">
+        <header class="topbar panel">
+          <div class="status-item">
+            <span class="status-label">Role</span>
+            <strong id="roleValue">Scanning</strong>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Local IP</span>
+            <select id="ipSelector" class="ip-select">
+              <option>Detecting...</option>
+            </select>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Connection</span>
+            <strong id="connectionValue" class="status-text warning">Scanning LAN</strong>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Online Devices</span>
+            <strong id="onlineValue">0</strong>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Avg Ping</span>
+            <strong id="pingValue">0 ms</strong>
+          </div>
+        </header>
+
+        <section class="workspace">
+          <section class="panel chat-panel">
+            <div class="panel-header">
+              <div>
+                <h2>Text Chat</h2>
+                <p id="targetSummary">No targets selected</p>
+              </div>
+              <span class="chip" id="localNameChip">Local device</span>
+            </div>
+            <div id="chatHistory" class="chat-history"></div>
+            <form id="chatForm" class="composer">
+              <input id="messageInput" type="text" placeholder="Write a LAN message..." autocomplete="off" />
+              <button class="button button-primary" type="submit">Send</button>
+            </form>
+          </section>
+
+          <section class="panel transfer-panel">
+            <div class="panel-header">
+              <div>
+                <h2>File Transfer</h2>
+                <p>Per-device progress and Mbps speed</p>
+              </div>
+              <button id="pickFileBtn" class="button button-secondary" type="button">Choose file</button>
+            </div>
+            <div class="file-picker">
+              <div>
+                <span class="status-label">Selected file</span>
+                <strong id="fileName">No file selected</strong>
+              </div>
+              <span id="fileSize" class="muted">0 B</span>
+              <button id="sendFileBtn" class="button button-primary" type="button" disabled>Send file</button>
+            </div>
+            <div id="transferList" class="transfer-list"></div>
+          </section>
+        </section>
+
+        <aside class="right-rail">
+          <section class="panel chart-panel">
+            <div class="panel-header">
+              <div>
+                <h2>Transfer Speed</h2>
+                <p>Realtime Mbps chart</p>
+              </div>
+              <span id="currentSpeed" class="metric-pill">0.00 Mbps</span>
+            </div>
+            <canvas id="speedChart"></canvas>
+          </section>
+
+          <section class="panel call-panel">
+            <div class="panel-header">
+              <div>
+                <h2>Voice / Video</h2>
+                <p id="callStatus">Idle</p>
+              </div>
+              <span id="callDot" class="status-dot offline"></span>
+            </div>
+            <div class="video-grid">
+              <div class="video-tile remote">
+                <video id="remoteVideo" autoplay playsinline></video>
+                <span>Remote stream</span>
+              </div>
+              <div class="video-tile local">
+                <video id="localVideo" autoplay playsinline muted></video>
+                <span>Local preview</span>
+              </div>
+            </div>
+            <div class="call-controls">
+              <button id="startCallBtn" class="button button-primary" type="button">Start call</button>
+              <button id="endCallBtn" class="button button-danger" type="button" disabled>End</button>
+              <button id="micBtn" class="icon-button active" type="button" title="Toggle microphone">Mic</button>
+              <button id="camBtn" class="icon-button active" type="button" title="Toggle webcam">Cam</button>
+            </div>
+          </section>
+        </aside>
+
+        <section class="panel log-panel">
+          <div class="panel-header compact">
+            <div>
+              <h2>Realtime Event Log</h2>
+              <p>Timestamped LAN activity</p>
+            </div>
+            <button id="clearLogBtn" class="button button-secondary" type="button">Clear</button>
+          </div>
+          <div id="eventLog" class="event-log"></div>
+        </section>
+      </main>
+    </div>
+    <script src="./renderer.js"></script>
+  </body>
+</html>
